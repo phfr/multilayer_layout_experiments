@@ -5,9 +5,9 @@ Fruchterman-Reingold: same isolated-only exclusion as the ForceAtlas2 family
 (small multi-node components are left in, force-directed handles them fine).
 
 Kamada-Kawai: relies on all-pairs shortest paths, which is only meaningful
-within a single connected component. Runs on the giant component (745/900
-nodes) only; every other node (isolated singles + the 14 small components)
-is placed via common.deterministic_fallback_shell.
+within a single connected component. Runs on the giant component only;
+every other node (isolated singles + small components, if any) is placed
+via common.deterministic_fallback_shell.
 """
 
 from __future__ import annotations

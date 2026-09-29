@@ -6,8 +6,8 @@ fundamentally different signal from every distance-based layout in this
 package (Pfeil et al., "Visualizing biological data in a virtual
 environment", Nature Communications 2021, uses this idea with GO-annotation
 feature vectors and random-walk-with-restart feature vectors; we substitute
-edge_type_c/type_a/community/degree as our available proxy signal, since we
-have no external annotation database).
+edge_type_c/layer/type_a/community/degree as our available proxy signal,
+since we have no external annotation database).
 """
 
 from __future__ import annotations
@@ -19,18 +19,22 @@ import umap
 
 import common as c
 
-TYPE_A_VALUES = ("protein", "transcript", "protein,transcript", "bridge", "metabolite")
-
 
 def build_feature_matrix(G: nx.Graph):
     """Per-node feature vector: fraction of incident edges of each
-    edge_type_c value, type_a one-hot, Louvain community one-hot, log-degree.
-    Every node (including isolated ones) gets a valid vector."""
+    edge_type_c value, layer one-hot, type_a one-hot (data-driven vocabulary;
+    absent type_a column -> no such block), Louvain community one-hot,
+    log-degree. Every node (including isolated ones) gets a valid vector."""
     nodes = sorted(G.nodes(), key=lambda n: int(n))
     partition = community_louvain.best_partition(G, random_state=c.GLOBAL_SEED)
     community_ids = sorted(set(partition.values()))
     community_idx = {cid: i for i, cid in enumerate(community_ids)}
-    type_a_idx = {t: i for i, t in enumerate(TYPE_A_VALUES)}
+    # Layer one-hot first, then raw type_a one-hot (a finer split within a
+    # layer, e.g. protein_bridge vs protein_differentially_expressed).
+    type_values = list(c.layer_order(G)) + sorted(
+        {G.nodes[n].get("type_a", "") for n in nodes} - {""}
+    )
+    type_a_idx = {t: i for i, t in enumerate(type_values)}
 
     edge_type_idx: dict[str, int] = {}
     per_node_counts = []
@@ -43,22 +47,23 @@ def build_feature_matrix(G: nx.Graph):
                 edge_type_idx[et] = len(edge_type_idx)
         per_node_counts.append(counts)
 
-    dim = len(edge_type_idx) + len(TYPE_A_VALUES) + len(community_ids) + 1
+    dim = len(edge_type_idx) + len(type_values) + len(community_ids) + 1
     X = np.zeros((len(nodes), dim))
     n_et = len(edge_type_idx)
-    n_ta = len(TYPE_A_VALUES)
+    n_ta = len(type_values)
 
     for row_i, (n, counts) in enumerate(zip(nodes, per_node_counts)):
         deg = G.degree(n)
         for et, cnt in counts.items():
             X[row_i, edge_type_idx[et]] = cnt / deg if deg else 0.0
+        X[row_i, n_et + type_a_idx[G.nodes[n]["layer"]]] = 1.0
         ta = G.nodes[n].get("type_a", "")
         if ta in type_a_idx:
             X[row_i, n_et + type_a_idx[ta]] = 1.0
         X[row_i, n_et + n_ta + community_idx[partition[n]]] = 1.0
         X[row_i, -1] = np.log1p(deg)
 
-    return nodes, X, {"edge_types": n_et, "type_a": n_ta, "communities": len(community_ids)}
+    return nodes, X, {"edge_types": n_et, "layer+type_a": n_ta, "communities": len(community_ids)}
 
 
 def run_landscape_1(G, node_layer, nodes_path):
@@ -78,7 +83,7 @@ def run_landscape_1(G, node_layer, nodes_path):
     meta = dict(
         method=(
             "VRNetzer-style functional landscape: per-node feature vector "
-            "(edge_type_c composition fractions + type_a one-hot + Louvain "
+            "(edge_type_c composition fractions + layer/type_a one-hot + Louvain "
             "community one-hot + log-degree) embedded via UMAP -- similarity "
             "in ANNOTATION space, not graph-distance space"
         ),

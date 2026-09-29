@@ -1,19 +1,24 @@
 #!/usr/bin/env python3
-"""Compute a battery of 3D graph layouts for the ppicml protein/metabolite
-multilayer network and bake them into nodes.tsv as x_<name>/y_<name>/z_<name>
-column triplets (the naming convention the viewer app auto-detects, see
-src/data/LayoutDetection.ts).
+"""Compute a battery of 3D graph layouts for a multilayer network given as
+nodes.tsv + edges.tsv and bake them into the OUTPUT folder's nodes.tsv as
+x_<name>/y_<name>/z_<name> column triplets (the naming convention the viewer
+app auto-detects, see src/data/LayoutDetection.ts).
 
 Usage:
-    python run_layouts.py                       # run every layout in the registry
-    python run_layouts.py --only fa2_1,mds_1     # run a subset
-    python run_layouts.py --list                 # print the registry, no writes
-    python run_layouts.py --dry-run              # build the graph, validate names, no writes
-    python run_layouts.py --nodes PATH --edges PATH --log PATH   # override default paths
+    python run_layouts.py -i INPUT_DIR -o OUTPUT_DIR              # run every layout in the registry
+    python run_layouts.py -i INPUT_DIR -o OUTPUT_DIR --only fa2_1,mds_1
+    python run_layouts.py --list                                  # print the registry, no reads/writes
+    python run_layouts.py -i INPUT_DIR --dry-run                  # build the graph, validate, no writes
+    python run_layouts.py -i IN -o OUT --layer-order transcript,protein,metabolite
 
-Every run appends a human-readable entry to layout_run_log.txt (same
-directory as nodes.tsv) recording its parameters, weighting scheme, and any
-disconnected-graph fallback notes.
+INPUT_DIR must contain nodes.tsv and edges.tsv and is never written to.
+OUTPUT_DIR (created if missing) receives:
+    nodes.tsv           input columns + one x_/y_/z_ triplet per layout
+    edges.tsv           verbatim copy of the input, so the folder is self-contained
+    layout_run_log.txt  append-only log; every run opens with the exact command line
+
+Node layers come from the `layer_c` column; --layer-order sets the stacking
+order (first = bottom / innermost) used by every layer-aware layout.
 """
 
 from __future__ import annotations
@@ -23,6 +28,7 @@ import sys
 import time
 import traceback
 import warnings
+from collections import Counter
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Callable
@@ -54,14 +60,17 @@ import method_paga as m_paga
 import method_pathway as m_pathway
 import method_shell as m_shell
 
-DEFAULT_DATA_DIR = (Path(__file__).resolve().parent.parent.parent / "public" / "data" / "ppicml")
-
 
 @dataclass
 class RunSpec:
     base_name: str
     func: Callable
     description: str
+    # nodes.tsv columns this layout needs (present AND non-empty for at least
+    # one node). A layout whose requirements the input doesn't meet is skipped
+    # with a SKIPPED log entry instead of failing the run -- e.g. the two
+    # pathways_a-driven layouts on a dataset without that annotation.
+    requires_columns: tuple[str, ...] = ()
     # Reserved: True would skip the elapsed-time spinner for a method that prints
     # its own real, tqdm-aware progress. Not used by anything currently -- node2vec
     # (quiet=True) and UMAP/openTSNE/PHATE/PaCMAP (verbose=False) are all silenced
@@ -69,12 +78,21 @@ class RunSpec:
     # terminal instead of being buried by raw (non-tqdm-aware) library output.
     native_progress: bool = False
 
+    def missing_requirements(self, header: list[str], rows: list[dict[str, str]]) -> list[str]:
+        missing = []
+        for col in self.requires_columns:
+            if col not in header:
+                missing.append(f"column {col!r} absent")
+            elif not any((row.get(col) or "").strip() for row in rows):
+                missing.append(f"column {col!r} empty for every node")
+        return missing
+
 
 REGISTRY: list[RunSpec] = [
     # Deterministic / cheap first, so a partial run still yields useful results fast.
-    RunSpec("shell_1", m_shell.run_shell_1, "Concentric shells: protein/bridge/metabolite"),
+    RunSpec("shell_1", m_shell.run_shell_1, "Concentric shells, one per layer in --layer-order (first = innermost)"),
     RunSpec("shell_2", m_shell.run_shell_2, "Concentric shells: reversed radius order"),
-    RunSpec("fa2_1", m_fa2.run_fa2_1, "ForceAtlas2, shared xy, discrete z per layer3"),
+    RunSpec("fa2_1", m_fa2.run_fa2_1, "ForceAtlas2, shared xy, discrete z per layer"),
     RunSpec("fa2_2", m_fa2.run_fa2_2, "ForceAtlas2, linlog+dissuade_hubs, z-stacked"),
     RunSpec("fa2_3", m_fa2.run_fa2_3, "ForceAtlas2, cross-layer down-weighted, z-stacked"),
     RunSpec("fa2sep_1", m_fa2.run_fa2sep_1, "ForceAtlas2 run independently per layer, z-stacked"),
@@ -97,8 +115,8 @@ REGISTRY: list[RunSpec] = [
     RunSpec("fa2spectral_1", m_fa2.run_fa2spectral_1, "ForceAtlas2 seeded with a spectral embedding (fCoSE-style)"),
     RunSpec("isomap_1", m_dist.run_isomap_1, "Isomap on giant component's hop-distance matrix"),
     RunSpec("hyp_1", m_hyp.run_hyp_1, "Hyperbolic-radius layout (r=1-tanh(degree/beta)), layer-banded"),
-    RunSpec("hive3_1", m_hive.run_hive3_1, "Hive-plot-style 3-axis layout, one spoke per layer3"),
-    RunSpec("hive5_1", m_hive.run_hive5_1, "Hive-plot-style 5-axis layout, one spoke per raw type_a value"),
+    RunSpec("hive3_1", m_hive.run_hive3_1, "Hive-plot-style layout, one spoke per layer"),
+    RunSpec("hive5_1", m_hive.run_hive5_1, "Hive-plot-style layout, one spoke per raw type_a value", requires_columns=("type_a",)),
     RunSpec("community_1", m_community.run_community_1, "Louvain community meta-layout + local sublayout"),
     RunSpec("community_shellz_1", m_community.run_community_shellz_1, "community_1 xy + shell_1 z-formula by predominant layer"),
     RunSpec("n2vbal_phate_1", m_n2v.run_n2vbal_phate_1, "node2vec (p=1,q=1) + PHATE(3D)"),
@@ -108,8 +126,8 @@ REGISTRY: list[RunSpec] = [
     RunSpec(
         "n2vlayered_1",
         m_layered.run_n2vlayered_1,
-        "Separate protein/metabolite node2vec+UMAP slabs, z-squeezed and offset, "
-        "bridge nodes placed by harmonic relaxation",
+        "Separate node2vec+UMAP slabs for the first and last layer, z-squeezed and offset, "
+        "middle-layer nodes placed by harmonic relaxation",
     ),
     # Added after the second (top-20-idea) deep-research pass: see README.md.
     RunSpec("landscape_1", m_landscape.run_landscape_1, "VRNetzer-style functional landscape (feature-matrix UMAP)"),
@@ -117,15 +135,23 @@ REGISTRY: list[RunSpec] = [
     RunSpec("paga_1", m_paga.run_paga_1, "PAGA-style two-level coarse (Louvain meta-graph) + fine (spring) layout"),
     RunSpec("metapath_1", m_metapath.run_metapath_1, "Domain-continuity-biased random walks + Word2Vec + UMAP(3D)"),
     RunSpec("ensemble_1", m_ensemble.run_ensemble_1, "Procrustes-aligned blend of fa23d_1 + mds_1 + spectral_1"),
-    RunSpec("domaintouch_1", m_centrality.run_domaintouch_1, "fa2_1 xy + z from # distinct domains touched by neighborhood"),
+    RunSpec("domaintouch_1", m_centrality.run_domaintouch_1, "fa2_1 xy + z from # distinct layers touched by neighborhood"),
     RunSpec("raritytouch_1", m_centrality.run_raritytouch_1, "fa2_1 xy + z from rarest incident edge_type_c"),
     RunSpec("n2vbal_densmap_1", m_n2v.run_n2vbal_densmap_1, "node2vec (p=1,q=1) + DensMAP(3D)"),
-    RunSpec("fa2rarity_1", m_fa2.run_fa2rarity_1, "ForceAtlas2 with full 10-bucket edge_type_c rarity weighting"),
+    RunSpec("fa2rarity_1", m_fa2.run_fa2rarity_1, "ForceAtlas2 with per-edge_type_c rarity weighting"),
     RunSpec("shell_rarity_1", m_shell.run_shell_rarity_1, "Concentric shells banded by rarest incident edge_type_c"),
     RunSpec("n2vbal_tsne_1", m_n2v.run_n2vbal_tsne_1, "node2vec (p=1,q=1) + openTSNE(3D)"),
-    # Added once real pathways_a annotation was added to nodes.tsv: see README.md.
-    RunSpec("fa2pathway_1", m_pathway.run_fa2pathway_1, "ForceAtlas2 with real edges boosted by shared-pathway Jaccard similarity"),
-    RunSpec("pathway_landscape_1", m_pathway.run_pathway_landscape_1, "Pure pathways_a functional landscape (TF-IDF+SVD+UMAP, neighbor-propagated)"),
+    # Need a pathways_a annotation column; skipped (not failed) when the input has none.
+    RunSpec(
+        "fa2pathway_1", m_pathway.run_fa2pathway_1,
+        "ForceAtlas2 with real edges boosted by shared-pathway Jaccard similarity",
+        requires_columns=("pathways_a",),
+    ),
+    RunSpec(
+        "pathway_landscape_1", m_pathway.run_pathway_landscape_1,
+        "Pure pathways_a functional landscape (TF-IDF+SVD+UMAP, neighbor-propagated)",
+        requires_columns=("pathways_a",),
+    ),
 ]
 
 
@@ -138,23 +164,59 @@ def validate_registry() -> None:
         seen.add(spec.base_name)
 
 
-def main() -> int:
-    parser = argparse.ArgumentParser(description=__doc__)
+def build_parser() -> argparse.ArgumentParser:
+    parser = argparse.ArgumentParser(
+        description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter
+    )
+    parser.add_argument(
+        "-i", "--input-dir", type=Path, default=None,
+        help=f"folder containing {c.NODES_FILENAME} and {c.EDGES_FILENAME}; never written to",
+    )
+    parser.add_argument(
+        "-o", "--output-dir", type=Path, default=None,
+        help=(
+            f"folder that receives {c.NODES_FILENAME} (input columns + layout columns), a copy "
+            f"of {c.EDGES_FILENAME}, and {c.LOG_FILENAME}; created if missing"
+        ),
+    )
+    parser.add_argument(
+        "--layer-order", type=str, default=",".join(c.LAYER_ORDER),
+        help=(
+            f"comma-separated values of the {c.LAYER_COLUMN} column, bottom/innermost first; "
+            f"must list exactly the values present (default: %(default)s)"
+        ),
+    )
     parser.add_argument("--only", type=str, default=None, help="comma-separated base_names to run")
     parser.add_argument("--list", action="store_true", help="print the registry and exit")
     parser.add_argument("--dry-run", action="store_true", help="build graph, validate, no writes")
-    parser.add_argument("--nodes", type=Path, default=DEFAULT_DATA_DIR / "nodes.tsv")
-    parser.add_argument("--edges", type=Path, default=DEFAULT_DATA_DIR / "edges.tsv")
-    parser.add_argument("--log", type=Path, default=DEFAULT_DATA_DIR / "layout_run_log.txt")
     parser.add_argument("--no-progress", action="store_true", help="disable progress bars")
+    return parser
+
+
+def main() -> int:
+    parser = build_parser()
     args = parser.parse_args()
 
     validate_registry()
 
     if args.list:
         for spec in REGISTRY:
-            print(f"{spec.base_name:12s} {spec.description}")
+            req = f"  [requires {', '.join(spec.requires_columns)}]" if spec.requires_columns else ""
+            print(f"{spec.base_name:20s} {spec.description}{req}")
         return 0
+
+    if args.input_dir is None:
+        parser.error("--input-dir is required (except with --list)")
+    if args.output_dir is None and not args.dry_run:
+        parser.error("--output-dir is required (except with --list / --dry-run)")
+    nodes_in = args.input_dir / c.NODES_FILENAME
+    edges_in = args.input_dir / c.EDGES_FILENAME
+    for path in (nodes_in, edges_in):
+        if not path.is_file():
+            parser.error(f"input file not found: {path}")
+    layer_order = c.parse_layer_order(args.layer_order)
+    if not layer_order:
+        parser.error("--layer-order must name at least one layer")
 
     selected = REGISTRY
     if args.only:
@@ -167,28 +229,84 @@ def main() -> int:
             return 2
         selected = [spec for spec in REGISTRY if spec.base_name in wanted]
 
-    print(f"Loading graph from {args.nodes} / {args.edges} ...")
-    data = c.load_graph(args.nodes, args.edges)
+    print(f"Loading graph from {args.input_dir} ...")
+    try:
+        data = c.load_graph(nodes_in, edges_in, layer_order=layer_order)
+    except ValueError as exc:
+        print(f"Cannot load input: {exc}", file=sys.stderr)
+        return 2
     G, node_layer = data.G, data.node_layer
     comps = c.sorted_components(G)
     n_isolated = len(c.isolated_nodes(G))
-    print(
+    layer_counts = Counter(node_layer.values())
+    layers_desc = ", ".join(f"{layer}={layer_counts[layer]}" for layer in layer_order)
+    graph_desc = (
         f"nodes={G.number_of_nodes()} edges={G.number_of_edges()} "
         f"components={len(comps)} giant={len(comps[0])} isolated={n_isolated}"
     )
+    print(graph_desc)
+    print(f"layers ({c.LAYER_COLUMN}, bottom->top): {layers_desc}")
+
+    skipped: list[tuple[str, str]] = []
+    runnable: list[RunSpec] = []
+    for spec in selected:
+        missing = spec.missing_requirements(data.header, data.node_rows)
+        if missing:
+            skipped.append((spec.base_name, "; ".join(missing)))
+        else:
+            runnable.append(spec)
 
     if args.dry_run:
-        print(f"Would run {len(selected)} layout(s):")
-        for spec in selected:
+        print(f"Would run {len(runnable)} layout(s):")
+        for spec in runnable:
             print(f"  {spec.base_name}")
+        for name, reason in skipped:
+            print(f"  {name}  (SKIPPED: {reason})")
+        if args.output_dir is not None:
+            print(f"Would write to {args.output_dir}")
         return 0
 
-    existing_bases = c.get_existing_layout_bases(data.header)
+    try:
+        out = c.prepare_output_dir(args.input_dir, args.output_dir)
+    except ValueError as exc:
+        print(f"Cannot prepare output dir: {exc}", file=sys.stderr)
+        return 2
+    for note in out.notes:
+        print(note)
+    c.append_run_header(
+        out.log,
+        argv=sys.argv,
+        details=[
+            f"input: {args.input_dir.resolve()}",
+            f"output: {args.output_dir.resolve()}",
+            f"graph: {graph_desc}",
+            f"layers: {c.LAYER_COLUMN} order={','.join(layer_order)} ({layers_desc})",
+            f"selected: {len(runnable)} layout(s): {', '.join(s.base_name for s in runnable)}",
+        ]
+        + [f"skipped: {name}: {reason}" for name, reason in skipped]
+        + out.notes,
+    )
+    for name, reason in skipped:
+        print(f"-> {name} SKIPPED: {reason}")
+        c.append_log_entry(
+            out.log,
+            base_name=name,
+            method="(skipped)",
+            library_call="(not run)",
+            params={},
+            weighting_desc="",
+            node_count=G.number_of_nodes(),
+            edge_count=G.number_of_edges(),
+            recomputed=False,
+            status=f"SKIPPED: {reason}",
+        )
+
+    existing_bases = c.get_existing_layout_bases(c.read_nodes_tsv(out.nodes)[0])
     failures: list[str] = []
 
     show_progress = not args.no_progress
     global_bar = tqdm(
-        selected,
+        runnable,
         desc="Layouts",
         unit="layout",
         position=0,
@@ -200,14 +318,14 @@ def main() -> int:
         tqdm.write(f"-> {spec.base_name} ({spec.description}) ...")
         try:
             if spec.native_progress or not show_progress:
-                coords, meta = spec.func(G, node_layer, args.nodes)
+                coords, meta = spec.func(G, node_layer, out.nodes)
             else:
                 with c.elapsed_spinner(spec.base_name):
-                    coords, meta = spec.func(G, node_layer, args.nodes)
+                    coords, meta = spec.func(G, node_layer, out.nodes)
             coords_tuples = {n: tuple(float(v) for v in p) for n, p in coords.items()}
-            recomputed = c.write_layout_columns(args.nodes, spec.base_name, coords_tuples)
+            recomputed = c.write_layout_columns(out.nodes, spec.base_name, coords_tuples)
             c.append_log_entry(
-                args.log,
+                out.log,
                 base_name=spec.base_name,
                 method=meta["method"],
                 library_call=meta["library_call"],
@@ -225,7 +343,7 @@ def main() -> int:
         except Exception as exc:  # noqa: BLE001 - batch script must continue past a single failure
             traceback.print_exc()
             c.append_log_entry(
-                args.log,
+                out.log,
                 base_name=spec.base_name,
                 method=spec.description,
                 library_call="(failed before/during computation)",
@@ -240,10 +358,13 @@ def main() -> int:
     global_bar.close()
 
     print()
+    print(f"Output: {out.nodes}  (log: {out.log})")
+    if skipped:
+        print(f"{len(skipped)} layout(s) skipped: {[name for name, _ in skipped]}")
     if failures:
-        print(f"{len(failures)}/{len(selected)} layout(s) FAILED: {failures}", file=sys.stderr)
+        print(f"{len(failures)}/{len(runnable)} layout(s) FAILED: {failures}", file=sys.stderr)
         return 1
-    print(f"All {len(selected)} layout(s) completed successfully.")
+    print(f"All {len(runnable)} layout(s) completed successfully.")
     return 0
 
 

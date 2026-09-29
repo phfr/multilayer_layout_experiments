@@ -1,5 +1,5 @@
-"""ForceAtlas2-based layouts: shared xy + discrete z-stack per layer3,
-per-layer independent runs, and native 3D. Small (2-10 node) connected
+"""ForceAtlas2-based layouts: shared xy + discrete z-stack per layer (planes
+ordered by --layer-order), per-layer independent runs, and native 3D. Small (2-10 node) connected
 components are left in the force simulation (force-directed layouts handle
 them fine); only fully isolated (degree-0) nodes are excluded and placed via
 a deterministic ring/shell afterward.
@@ -16,11 +16,10 @@ import common as c
 
 
 def _rarity_weights(G: nx.Graph) -> dict[str, float]:
-    """weight = -ln(edge_type_c count / total edges): the full 10-bucket
-    rarity table, not the binary within/cross-layer split fa2_3 uses -- the
-    28 rare metabolite-protein edges get pulled ~3.4x tighter than the 500
-    common metabolite-metabolite edges, instead of both being lumped into
-    one 'cross-layer' bucket."""
+    """weight = -ln(edge_type_c count / total edges): one weight per distinct
+    edge_type_c value (data-driven), not the binary within/cross-layer split
+    fa2_3 uses -- edges of a rare type get pulled tighter than edges of a
+    common type instead of both being lumped into one 'cross-layer' bucket."""
     counts = Counter(data.get("edge_type_c", "") for _, _, data in G.edges(data=True))
     total = sum(counts.values()) or 1
     return {et: -math.log(cnt / total) for et, cnt in counts.items()}
@@ -30,14 +29,14 @@ def run_fa2_1(G, node_layer, nodes_path):
     iso = c.isolated_nodes(G)
     Gc = G.subgraph([n for n in G.nodes() if n not in iso])
     xy = nx.forceatlas2_layout(Gc, max_iter=100, seed=c.GLOBAL_SEED, dim=2)
-    coords, z_by_layer = c.layer_z_stack(xy, node_layer)
+    coords, z_by_layer = c.layer_z_stack(xy, node_layer, order=c.layer_order(G))
     coords.update(c.place_isolated_ring_per_layer(xy, node_layer, iso, z_by_layer))
     meta = dict(
-        method="ForceAtlas2 (shared xy, discrete z per layer3)",
+        method="ForceAtlas2 (shared xy, discrete z per layer)",
         library_call="nx.forceatlas2_layout(G, max_iter=100, seed=42, dim=2)",
         params={"max_iter": 100, "seed": c.GLOBAL_SEED, "dim": 2},
         weighting_desc="unweighted",
-        fallback_notes=f"{len(iso)} isolated nodes ring-placed per layer3 at z={z_by_layer}",
+        fallback_notes=f"{len(iso)} isolated nodes ring-placed per layer at z={z_by_layer}",
     )
     return coords, meta
 
@@ -48,10 +47,10 @@ def run_fa2_2(G, node_layer, nodes_path):
     xy = nx.forceatlas2_layout(
         Gc, max_iter=100, seed=c.GLOBAL_SEED, dim=2, linlog=True, dissuade_hubs=True
     )
-    coords, z_by_layer = c.layer_z_stack(xy, node_layer)
+    coords, z_by_layer = c.layer_z_stack(xy, node_layer, order=c.layer_order(G))
     coords.update(c.place_isolated_ring_per_layer(xy, node_layer, iso, z_by_layer))
     meta = dict(
-        method="ForceAtlas2 (linlog + dissuade_hubs, shared xy, discrete z per layer3)",
+        method="ForceAtlas2 (linlog + dissuade_hubs, shared xy, discrete z per layer)",
         library_call=(
             "nx.forceatlas2_layout(G, max_iter=100, seed=42, dim=2, "
             "linlog=True, dissuade_hubs=True)"
@@ -64,7 +63,7 @@ def run_fa2_2(G, node_layer, nodes_path):
             "dissuade_hubs": True,
         },
         weighting_desc="unweighted",
-        fallback_notes=f"{len(iso)} isolated nodes ring-placed per layer3 at z={z_by_layer}",
+        fallback_notes=f"{len(iso)} isolated nodes ring-placed per layer at z={z_by_layer}",
     )
     return coords, meta
 
@@ -74,20 +73,20 @@ def run_fa2_3(G, node_layer, nodes_path):
     Gc = G.subgraph([n for n in G.nodes() if n not in iso]).copy()
     c.set_attraction_weight(Gc, node_layer)
     xy = nx.forceatlas2_layout(Gc, max_iter=100, seed=c.GLOBAL_SEED, dim=2, weight="fa_weight")
-    coords, z_by_layer = c.layer_z_stack(xy, node_layer)
+    coords, z_by_layer = c.layer_z_stack(xy, node_layer, order=c.layer_order(G))
     coords.update(c.place_isolated_ring_per_layer(xy, node_layer, iso, z_by_layer))
     meta = dict(
-        method="ForceAtlas2 (cross-layer down-weighted, shared xy, discrete z per layer3)",
+        method="ForceAtlas2 (cross-layer down-weighted, shared xy, discrete z per layer)",
         library_call="nx.forceatlas2_layout(G, max_iter=100, seed=42, dim=2, weight='fa_weight')",
         params={"max_iter": 100, "seed": c.GLOBAL_SEED, "dim": 2, "weight": "fa_weight"},
         weighting_desc=f"attraction: within={c.ATTRACTION_WITHIN}, cross={c.ATTRACTION_CROSS}",
-        fallback_notes=f"{len(iso)} isolated nodes ring-placed per layer3 at z={z_by_layer}",
+        fallback_notes=f"{len(iso)} isolated nodes ring-placed per layer at z={z_by_layer}",
     )
     return coords, meta
 
 
 def run_fa2sep_1(G, node_layer, nodes_path):
-    layers = ("protein", "bridge", "metabolite")
+    layers = c.layer_order(G)
     xy: dict[str, tuple] = {}
     iso_all: list[str] = []
     for layer in layers:
@@ -99,19 +98,19 @@ def run_fa2sep_1(G, node_layer, nodes_path):
         if sub_conn.number_of_nodes():
             xy.update(nx.forceatlas2_layout(sub_conn, max_iter=100, seed=c.GLOBAL_SEED, dim=2))
 
-    coords, z_by_layer = c.layer_z_stack(xy, node_layer)
+    coords, z_by_layer = c.layer_z_stack(xy, node_layer, order=c.layer_order(G))
     coords.update(c.place_isolated_ring_per_layer(xy, node_layer, iso_all, z_by_layer))
     meta = dict(
         method=(
-            "ForceAtlas2 run independently per layer3 (induced subgraphs), "
+            "ForceAtlas2 run independently per layer (induced subgraphs), "
             "xy left overlapping across layers, z-stacked"
         ),
-        library_call="nx.forceatlas2_layout(layer_subgraph, max_iter=100, seed=42, dim=2) x3",
-        params={"max_iter": 100, "seed": c.GLOBAL_SEED, "dim": 2},
+        library_call=f"nx.forceatlas2_layout(layer_subgraph, max_iter=100, seed=42, dim=2) x{len(layers)}",
+        params={"max_iter": 100, "seed": c.GLOBAL_SEED, "dim": 2, "layers": layers},
         weighting_desc="none (cross-layer edges excluded by induced subgraph)",
         fallback_notes=(
             f"{len(iso_all)} within-layer-isolated nodes ring-placed per their own "
-            f"layer3 at z={z_by_layer}"
+            f"layer at z={z_by_layer}"
         ),
     )
     return coords, meta
@@ -121,22 +120,33 @@ def run_fa2spectral_1(G, node_layer, nodes_path):
     """Spectral-seeded ForceAtlas2 (the fCoSE trick from Cytoscape's
     Compound Spring Embedder: seed force-directed layout with a spectral
     embedding instead of random init, for better global structure / faster
-    convergence). Shared xy, discrete z per layer3 like fa2_1.
+    convergence). Shared xy, discrete z per layer like fa2_1.
     """
     iso = c.isolated_nodes(G)
     Gc = G.subgraph([n for n in G.nodes() if n not in iso])
-    seed_pos = c.spectral_positions(Gc, 2)
+    # Rescale + jitter the seed: raw spectral coordinates put structurally
+    # equivalent nodes at identical points, which makes FA2's repulsion
+    # explode (see common.SEED_JITTER_FRACTION).
+    seed_pos = c.prepare_seed_positions(c.spectral_positions(Gc, 2))
     xy = nx.forceatlas2_layout(Gc, pos=seed_pos, max_iter=100, seed=c.GLOBAL_SEED, dim=2)
-    coords, z_by_layer = c.layer_z_stack(xy, node_layer)
+    coords, z_by_layer = c.layer_z_stack(xy, node_layer, order=c.layer_order(G))
     coords.update(c.place_isolated_ring_per_layer(xy, node_layer, iso, z_by_layer))
     meta = dict(
         method="ForceAtlas2 seeded with a spectral embedding (fCoSE-style warm start), z-stacked",
         library_call=(
-            "nx.forceatlas2_layout(G, pos=spectral_positions(G, 2), max_iter=100, seed=42, dim=2)"
+            "nx.forceatlas2_layout(G, pos=prepare_seed_positions(spectral_positions(G, 2)), "
+            "max_iter=100, seed=42, dim=2)"
         ),
-        params={"max_iter": 100, "seed": c.GLOBAL_SEED, "dim": 2, "seeded": True},
+        params={
+            "max_iter": 100,
+            "seed": c.GLOBAL_SEED,
+            "dim": 2,
+            "seeded": True,
+            "seed_rms_per_sqrt_n": c.SEED_TARGET_RMS_PER_SQRT_N,
+            "seed_jitter_fraction": c.SEED_JITTER_FRACTION,
+        },
         weighting_desc="unweighted",
-        fallback_notes=f"{len(iso)} isolated nodes ring-placed per layer3 at z={z_by_layer}",
+        fallback_notes=f"{len(iso)} isolated nodes ring-placed per layer at z={z_by_layer}",
     )
     return coords, meta
 
@@ -181,11 +191,11 @@ def run_fa2rarity_1(G, node_layer, nodes_path):
     for _, _, data in Gc.edges(data=True):
         data["rarity_weight"] = weights.get(data.get("edge_type_c", ""), 1.0)
     xy = nx.forceatlas2_layout(Gc, max_iter=100, seed=c.GLOBAL_SEED, dim=2, weight="rarity_weight")
-    coords, z_by_layer = c.layer_z_stack(xy, node_layer)
+    coords, z_by_layer = c.layer_z_stack(xy, node_layer, order=c.layer_order(G))
     coords.update(c.place_isolated_ring_per_layer(xy, node_layer, iso, z_by_layer))
     meta = dict(
         method=(
-            "ForceAtlas2 with full 10-bucket edge_type_c rarity weighting "
+            "ForceAtlas2 with per-edge_type_c rarity weighting "
             "(-ln(count/total), not the binary within/cross-layer split), z-stacked"
         ),
         library_call="nx.forceatlas2_layout(G, max_iter=100, seed=42, dim=2, weight='rarity_weight')",
@@ -195,7 +205,7 @@ def run_fa2rarity_1(G, node_layer, nodes_path):
             "dim": 2,
             "rarity_weights": {k: round(v, 3) for k, v in weights.items()},
         },
-        weighting_desc="attraction weight = -ln(edge_type_c count / total edges), full 10-bucket table",
-        fallback_notes=f"{len(iso)} isolated nodes ring-placed per layer3 at z={z_by_layer}",
+        weighting_desc="attraction weight = -ln(edge_type_c count / total edges), one bucket per distinct type",
+        fallback_notes=f"{len(iso)} isolated nodes ring-placed per layer at z={z_by_layer}",
     )
     return coords, meta

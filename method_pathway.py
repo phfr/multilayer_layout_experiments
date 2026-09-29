@@ -1,9 +1,10 @@
-"""Layouts driven by the real pathways_a biological annotation (Reactome-
-style pathway names), not structural proxies. pathways_a only annotates
-~428/900 nodes directly -- notably ZERO metabolites, since it's a
-gene-centric annotation -- so both layouts here have an explicit strategy
-for the coverage gap rather than silently ignoring three-quarters of the
-graph.
+"""Layouts driven by a real pathways_a biological annotation column
+(Reactome-style pathway names), not structural proxies. The column is
+optional: run_layouts.py skips both layouts (with a SKIPPED log entry) when
+the input has no pathways_a or it is empty for every node. When present it
+typically annotates only a subset of nodes (gene-centric, so metabolites
+are usually unannotated), so both layouts have an explicit strategy for
+the coverage gap rather than silently ignoring the rest of the graph.
 """
 
 from __future__ import annotations
@@ -51,7 +52,7 @@ def run_fa2pathway_1(G, node_layer, nodes_path):
         data["pathway_weight"] = 1.0 + PATHWAY_BOOST * j
 
     xy = nx.forceatlas2_layout(Gc, max_iter=100, seed=c.GLOBAL_SEED, dim=2, weight="pathway_weight")
-    coords, z_by_layer = c.layer_z_stack(xy, node_layer)
+    coords, z_by_layer = c.layer_z_stack(xy, node_layer, order=c.layer_order(G))
     coords.update(c.place_isolated_ring_per_layer(xy, node_layer, iso, z_by_layer))
 
     meta = dict(
@@ -65,7 +66,7 @@ def run_fa2pathway_1(G, node_layer, nodes_path):
         weighting_desc=f"attraction weight = 1.0 + {PATHWAY_BOOST} * Jaccard(endpoint pathway sets)",
         fallback_notes=(
             f"{n_boosted}/{Gc.number_of_edges()} real edges got a nonzero pathway-"
-            f"similarity boost; {len(iso)} isolated nodes ring-placed per layer3 at "
+            f"similarity boost; {len(iso)} isolated nodes ring-placed per layer at "
             f"z={z_by_layer}"
         ),
     )
@@ -117,7 +118,7 @@ def run_pathway_landscape_1(G, node_layer, nodes_path):
     structural proxies like landscape_1/rwr_1): TF-IDF-weighted pathway
     multi-hot -> TruncatedSVD -> UMAP(3D). Similarity here means real
     biological pathway co-membership, propagated through the graph to cover
-    the ~472 nodes (incl. all 300 metabolites) with no direct annotation.
+    nodes (typically all metabolites) with no direct annotation.
     """
     nodes, X, has_signal, has_direct, vocab = _build_pathway_matrix(G)
 

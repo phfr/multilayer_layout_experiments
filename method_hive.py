@@ -6,9 +6,12 @@ which place typed nodes on axes ordered by a numeric attribute specifically
 to cut hairball clutter in typed networks. Adapted from their usual 2D
 layout to axes spread in 3D via a Fibonacci-sphere direction.
 
-hive3_1 groups by layer3 (3 axes); hive5_1 groups by the raw type_a (5
-axes) -- this makes the 21 dual-typed 'protein,transcript' nodes
-structurally visible on their own spoke instead of folded into "protein".
+hive3_1 groups by layer (one axis per --layer-order entry); hive5_1
+groups by the raw type_a value (one axis per distinct value, ordered by the
+value's layer then name) -- a finer split that shows sub-types within a
+layer (e.g. differentially-expressed vs. bridge proteins) on their own
+spoke. The base names keep their historical 3/5 suffixes; the axis count is
+data-driven.
 """
 
 from __future__ import annotations
@@ -32,13 +35,13 @@ def _hive_layout(G, groups: dict[str, list[str]]):
 
 
 def run_hive3_1(G, node_layer, nodes_path):
-    layers = ("protein", "bridge", "metabolite")
+    layers = c.layer_order(G)
     groups = {layer: [n for n, l in node_layer.items() if l == layer] for layer in layers}
     coords, axis_sizes = _hive_layout(G, groups)
 
     meta = dict(
-        method="Hive-plot-inspired 3-axis layout: one radial spoke per layer3, ordered by degree",
-        library_call="deterministic geometry (no simulation); axis directions from fibonacci_sphere(3)",
+        method=f"Hive-plot-inspired {len(layers)}-axis layout: one radial spoke per layer, ordered by degree",
+        library_call=f"deterministic geometry (no simulation); axis directions from fibonacci_sphere({len(layers)})",
         params={
             "axis_length": c.HIVE_AXIS_LENGTH,
             "axis_sizes": axis_sizes,
@@ -51,20 +54,25 @@ def run_hive3_1(G, node_layer, nodes_path):
 
 
 def run_hive5_1(G, node_layer, nodes_path):
-    type_a_values = ("protein", "transcript", "protein,transcript", "bridge", "metabolite")
-    groups = {
-        ta: [n for n in G.nodes() if G.nodes[n].get("type_a") == ta] for ta in type_a_values
-    }
+    layer_rank = {layer: i for i, layer in enumerate(c.layer_order(G))}
+    by_type: dict[str, list[str]] = {}
+    for n in G.nodes():
+        by_type.setdefault(G.nodes[n].get("type_a", ""), []).append(n)
+    # Axes ordered by the layer their nodes belong to (then name), so sub-types
+    # of one layer sit on adjacent spokes.
+    type_a_values = sorted(
+        by_type, key=lambda ta: (min(layer_rank[node_layer[n]] for n in by_type[ta]), ta)
+    )
+    groups = {ta: by_type[ta] for ta in type_a_values}
     coords, axis_sizes = _hive_layout(G, groups)
 
     meta = dict(
         method=(
-            "Hive-plot-inspired 5-axis layout: one radial spoke per raw type_a value "
-            "(protein/transcript/protein,transcript/bridge/metabolite), ordered by degree. "
-            "Makes the 21 dual-typed nodes structurally visible on their own spoke "
-            "instead of folded into layer3's coarser 'protein' bucket."
+            f"Hive-plot-inspired {len(groups)}-axis layout: one radial spoke per raw type_a "
+            f"value ({'/'.join(type_a_values)}), ordered by degree -- shows sub-types "
+            "within a layer on their own spoke"
         ),
-        library_call="deterministic geometry (no simulation); axis directions from fibonacci_sphere(5)",
+        library_call=f"deterministic geometry (no simulation); axis directions from fibonacci_sphere({len(groups)})",
         params={
             "axis_length": c.HIVE_AXIS_LENGTH,
             "axis_sizes": axis_sizes,

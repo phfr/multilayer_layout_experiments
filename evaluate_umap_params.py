@@ -16,10 +16,13 @@ n2vbal_phate_1, scoring each combination on two axes:
 Prints a ranked table and a recommended (n_neighbors, min_dist, spread)
 balancing both (normalized trust - normalized cv).
 
+Read-only: takes the same --input-dir / --layer-order as run_layouts.py and
+writes nothing.
+
 Usage:
-    python evaluate_umap_params.py
-    python evaluate_umap_params.py --p 0.25 --q 4   # evaluate for n2vbfs's walk bias
-    python evaluate_umap_params.py --n-neighbors-grid 10,15,30,50 \\
+    python evaluate_umap_params.py -i INPUT_DIR
+    python evaluate_umap_params.py -i INPUT_DIR --p 0.25 --q 4   # evaluate for n2vbfs's walk bias
+    python evaluate_umap_params.py -i INPUT_DIR --n-neighbors-grid 10,15,30,50 \\
         --min-dist-grid 0.1,0.3,0.5,0.8 --spread-grid 1.0,1.5,2.0
 """
 
@@ -36,8 +39,6 @@ from sklearn.manifold import trustworthiness
 
 import common as c
 from method_node2vec import _node2vec_embedding
-
-DEFAULT_DATA_DIR = Path(__file__).resolve().parent.parent.parent / "public" / "data" / "ppicml"
 
 
 def nn_distance_cv(points: np.ndarray) -> float:
@@ -57,12 +58,22 @@ def main() -> int:
     parser.add_argument("--min-dist-grid", type=str, default="0.1,0.3,0.5,0.8")
     parser.add_argument("--spread-grid", type=str, default="1.0,1.5,2.0")
     parser.add_argument("--trust-k", type=int, default=10, help="neighborhood size for trustworthiness")
-    parser.add_argument("--nodes", type=Path, default=DEFAULT_DATA_DIR / "nodes.tsv")
-    parser.add_argument("--edges", type=Path, default=DEFAULT_DATA_DIR / "edges.tsv")
+    parser.add_argument(
+        "-i", "--input-dir", type=Path, required=True,
+        help=f"folder containing {c.NODES_FILENAME} and {c.EDGES_FILENAME} (read-only)",
+    )
+    parser.add_argument(
+        "--layer-order", type=str, default=",".join(c.LAYER_ORDER),
+        help=f"comma-separated {c.LAYER_COLUMN} values, as for run_layouts.py (default: %(default)s)",
+    )
     args = parser.parse_args()
 
     print(f"Loading graph and computing node2vec embedding (p={args.p}, q={args.q}) ...", flush=True)
-    data = c.load_graph(args.nodes, args.edges)
+    data = c.load_graph(
+        args.input_dir / c.NODES_FILENAME,
+        args.input_dir / c.EDGES_FILENAME,
+        layer_order=c.parse_layer_order(args.layer_order),
+    )
     _, giant_nodes, vectors = _node2vec_embedding(data.G, p=args.p, q=args.q)
     print(f"Embedding shape: {vectors.shape}\n", flush=True)
 

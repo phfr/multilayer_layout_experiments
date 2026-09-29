@@ -1,9 +1,11 @@
-"""Shared IO, graph-building, weighting, and placement helpers for the ppicml
-layout-generation scripts (run_layouts.py + method_*.py).
+"""Shared IO, graph-building, weighting, and placement helpers for the
+multilayer layout-generation scripts (run_layouts.py + method_*.py).
 
 nodes.tsv / edges.tsv are read as raw strings; only numeric parsing happens
-where a specific script needs it. Values are written back with CRLF line
-endings to match the existing files' convention.
+where a specific script needs it. The input folder is never written to: the
+output folder gets its own nodes.tsv (input columns + layout columns), a
+verbatim copy of edges.tsv, and layout_run_log.txt. Layout columns are
+written with whatever line terminator (LF or CRLF) the file already uses.
 """
 
 from __future__ import annotations
@@ -11,9 +13,12 @@ from __future__ import annotations
 import csv
 import math
 import os
+import shlex
+import shutil
+import sys
 import threading
-from collections import defaultdict
-from dataclasses import dataclass
+from collections import Counter, defaultdict
+from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Iterable
@@ -28,7 +33,23 @@ from tqdm import tqdm
 
 GLOBAL_SEED = 42
 
-# fa2_1/fa2_2/fa2_3/fa2sep_1: z offset per layer3, as a fraction of the xy spread.
+# Layer model. LAYER_COLUMN is the nodes.tsv column holding each node's layer
+# (a categorical `_c` column, per the frontend's suffix convention). LAYER_ORDER
+# is the default stacking order, first = bottom / innermost, last = top /
+# outermost, used by every layout that arranges layers along an axis or in
+# concentric shells; run_layouts.py --layer-order overrides it per run, and the
+# effective order is stored on the graph (G.graph["layer_order"], read via
+# layer_order(G)). The order must list exactly the values present in the data.
+LAYER_COLUMN = "layer_c"
+LAYER_ORDER = ("transcript", "protein", "metabolite")
+
+# Output folder file names (input folder uses the same nodes/edges names).
+NODES_FILENAME = "nodes.tsv"
+EDGES_FILENAME = "edges.tsv"
+LOG_FILENAME = "layout_run_log.txt"
+
+# fa2_1/fa2_2/fa2_3/fa2sep_1: z offset between adjacent layers, as a fraction
+# of the xy spread.
 Z_STACK_FRACTION = 0.15
 
 # Attraction-style weighting (ForceAtlas2, spring): higher = stronger pull = closer.
@@ -70,6 +91,18 @@ N2V_UMAP_NEIGHBORS = 15
 N2V_UMAP_MIN_DIST = 0.5
 N2V_UMAP_SPREAD = 2.0
 
+# Warm-start seeds for force layouts (fa2spectral_1): a spectral embedding
+# puts structurally equivalent nodes at numerically identical coordinates
+# (observed: min pairwise distance ~1e-17), and ForceAtlas2's 1/d^2 repulsion
+# then blows the layout up to ~1e8 units. prepare_seed_positions() rescales
+# the seed to SEED_TARGET_RMS_PER_SQRT_N * sqrt(n) RMS radius (comparable to
+# an unseeded run's scale) and adds a deterministic Gaussian jitter of
+# SEED_JITTER_FRACTION of that radius to break the ties. Both values were
+# checked on the current data: the jittered seed yields a span comparable to
+# the unseeded run instead of 1e8.
+SEED_TARGET_RMS_PER_SQRT_N = 1.0
+SEED_JITTER_FRACTION = 0.01
+
 # Hyperbolic-radius layout (hyp_1): r = 1 - tanh(degree / HYP_BETA).
 HYP_RADIUS_SCALE = 50.0
 
@@ -90,8 +123,16 @@ def validate_base_name(base_name: str) -> None:
 
 
 # --------------------------------------------------------------------------
-# TSV IO (CRLF-preserving, no pandas, matching utils/*.py convention)
+# TSV IO (line-terminator-preserving, no pandas)
 # --------------------------------------------------------------------------
+
+
+def detect_line_terminator(path: Path) -> str:
+    """Returns "\r\n" if the file's first line ends in CRLF, else "\n", so
+    a rewrite keeps whatever convention the input files came with."""
+    with open(path, "rb") as f:
+        first = f.readline()
+    return "\r\n" if first.endswith(b"\r\n") else "\n"
 
 
 def read_nodes_tsv(path: Path) -> tuple[list[str], list[dict[str, str]]]:
@@ -129,14 +170,17 @@ def write_layout_columns(
     *,
     precision: int = 6,
 ) -> bool:
-    """Add or overwrite x_<base>/y_<base>/z_<base> columns in nodes.tsv.
+    """Add or overwrite x_<base>/y_<base>/z_<base> columns in the OUTPUT
+    nodes.tsv (never the input one -- see prepare_output_dir).
 
     Re-reads the file fresh so sequential calls in one process each see prior
     runs' columns. Never reorders/touches existing columns; new columns are
-    appended at the end. Writes atomically (temp file + os.replace).
-    Returns True if this overwrote an existing base_name, False if new.
+    appended at the end. Writes atomically (temp file + os.replace) with the
+    file's existing line terminator. Returns True if this overwrote an
+    existing base_name, False if new.
     """
     validate_base_name(base_name)
+    lineterminator = detect_line_terminator(nodes_path)
     header, rows = read_nodes_tsv(nodes_path)
 
     x_col, y_col, z_col = f"x_{base_name}", f"y_{base_name}", f"z_{base_name}"
@@ -157,13 +201,109 @@ def write_layout_columns(
         row[y_col] = f"{float(y):.{precision}f}"
         row[z_col] = f"{float(z):.{precision}f}"
 
-    tmp_path = nodes_path.with_name(nodes_path.name + ".tmp")
+    _write_tsv_atomic(nodes_path, header, rows, lineterminator=lineterminator)
+    return is_overwrite
+
+
+def _write_tsv_atomic(path: Path, header: list[str], rows: list[dict[str, str]], *, lineterminator: str) -> None:
+    tmp_path = path.with_name(path.name + ".tmp")
     with open(tmp_path, "w", newline="", encoding="utf-8") as f:
-        writer = csv.DictWriter(f, fieldnames=header, delimiter="\t", lineterminator="\r\n")
+        writer = csv.DictWriter(f, fieldnames=header, delimiter="\t", lineterminator=lineterminator)
         writer.writeheader()
         writer.writerows(rows)
-    os.replace(tmp_path, nodes_path)
-    return is_overwrite
+    os.replace(tmp_path, path)
+
+
+@dataclass
+class OutputPaths:
+    nodes: Path
+    edges: Path
+    log: Path
+    notes: list[str] = field(default_factory=list)
+
+
+def prepare_output_dir(input_dir: Path, output_dir: Path) -> OutputPaths:
+    """Creates output_dir and seeds it from input_dir so every layout can
+    read/write the OUTPUT nodes.tsv and the input folder stays untouched:
+
+    - output/nodes.tsv absent: byte-for-byte copy of input/nodes.tsv.
+    - output/nodes.tsv present (an earlier run into the same folder): rebuilt
+      as input/nodes.tsv's columns + the layout column triplets already in
+      the output file (carried over by node id, so `--only` runs accumulate
+      and layouts that reuse fa2_1's xy keep working). The node id set must
+      match exactly; otherwise it is a different dataset and we refuse rather
+      than silently mixing coordinates.
+    - output/edges.tsv: verbatim copy of input/edges.tsv (so the output folder
+      is a complete, self-contained dataset for the viewer).
+    - output/layout_run_log.txt: path only (created on first append).
+
+    Pointing --output-dir at the input folder is allowed and degrades to the
+    old in-place behaviour (nothing is copied).
+    """
+    nodes_in, edges_in = input_dir / NODES_FILENAME, input_dir / EDGES_FILENAME
+    output_dir.mkdir(parents=True, exist_ok=True)
+    nodes_out, edges_out = output_dir / NODES_FILENAME, output_dir / EDGES_FILENAME
+    log_out = output_dir / LOG_FILENAME
+    notes: list[str] = []
+
+    if nodes_out.exists() and os.path.samefile(nodes_in, nodes_out):
+        notes.append(f"output dir is the input dir: layout columns are added to {nodes_out} in place")
+        return OutputPaths(nodes=nodes_out, edges=edges_out, log=log_out, notes=notes)
+
+    if not nodes_out.exists():
+        shutil.copyfile(nodes_in, nodes_out)
+        notes.append(f"seeded {nodes_out} from {nodes_in}")
+    else:
+        header_in, rows_in = read_nodes_tsv(nodes_in)
+        header_out, rows_out = read_nodes_tsv(nodes_out)
+        ids_in = [r["id"] for r in rows_in]
+        if set(ids_in) != {r["id"] for r in rows_out}:
+            raise ValueError(
+                f"{nodes_out} already exists but holds a different node id set than "
+                f"{nodes_in} ({len(rows_out)} vs {len(rows_in)} rows); delete it or pick "
+                "another --output-dir instead of mixing datasets"
+            )
+        carried = [
+            col for col in header_out
+            if col not in header_in and col[:2] in ("x_", "y_", "z_")
+            and col[2:] in get_existing_layout_bases(header_out)
+        ]
+        by_id = {r["id"]: r for r in rows_out}
+        for row in rows_in:
+            src = by_id[row["id"]]
+            for col in carried:
+                row[col] = src[col]
+        _write_tsv_atomic(
+            nodes_out, header_in + carried, rows_in, lineterminator=detect_line_terminator(nodes_in)
+        )
+        bases = sorted(get_existing_layout_bases(header_in + carried))
+        notes.append(
+            f"rebuilt {nodes_out} from {nodes_in} + {len(carried)} layout column(s) "
+            f"carried over from the previous run (layouts now present: {bases})"
+        )
+
+    shutil.copyfile(edges_in, edges_out)
+    notes.append(f"copied {edges_in} -> {edges_out}")
+    return OutputPaths(nodes=nodes_out, edges=edges_out, log=log_out, notes=notes)
+
+
+def append_run_header(log_path: Path, *, argv: list[str], details: list[str]) -> None:
+    """Writes the run banner that opens every run's block in the log: the
+    exact command line first (shlex-quoted, copy-pasteable), then the
+    interpreter/cwd/timestamp and any caller-supplied detail lines."""
+    ts = datetime.now(timezone.utc).isoformat(timespec="seconds")
+    rule = "#" * 72
+    lines = [
+        rule,
+        f"# cmd: {shlex.join(argv)}",
+        f"# started: {ts}",
+        f"# cwd: {os.getcwd()}",
+        f"# python: {sys.executable} ({sys.version.split()[0]})",
+    ]
+    lines.extend(f"# {d}" for d in details)
+    lines.append(rule)
+    with open(log_path, "a", encoding="utf-8") as f:
+        f.write("\n".join(lines) + "\n\n")
 
 
 def append_log_entry(
@@ -203,46 +343,88 @@ def append_log_entry(
 # --------------------------------------------------------------------------
 
 
-def layer3(type_a: str) -> str:
-    if type_a == "metabolite":
-        return "metabolite"
-    if type_a == "bridge":
-        return "bridge"
-    return "protein"
+def layer_order(G: nx.Graph) -> tuple[str, ...]:
+    """The layer stacking order this graph was loaded with (see LAYER_ORDER)."""
+    return tuple(G.graph.get("layer_order", LAYER_ORDER))
+
+
+def layer_axis_offsets(order: Iterable[str], step: float) -> dict[str, float]:
+    """Signed offsets along one axis, one per layer in `order`, centred on
+    zero with `step` between neighbours: 3 layers -> -step, 0, +step."""
+    order = tuple(order)
+    mid = (len(order) - 1) / 2.0
+    return {layer: (i - mid) * step for i, layer in enumerate(order)}
 
 
 def parse_pathways(raw: str) -> frozenset:
-    """pathways_a is a comma-separated list of pathway names (empty string
-    for the ~772/900 nodes with no annotation -- notably ALL metabolites,
-    since pathway membership here is a gene-centric annotation)."""
+    """pathways_a (optional column) is a comma-separated list of pathway
+    names; empty string / missing column -> empty set."""
     if not raw or not raw.strip():
         return frozenset()
     return frozenset(t.strip() for t in raw.split(",") if t.strip())
 
 
 def build_graph(
-    node_rows: list[dict[str, str]], edge_rows: list[dict[str, str]]
+    node_rows: list[dict[str, str]],
+    edge_rows: list[dict[str, str]],
+    *,
+    layer_column: str = LAYER_COLUMN,
+    layer_order: Iterable[str] = LAYER_ORDER,
 ) -> tuple[nx.Graph, dict[str, str]]:
     """Adds every node id from node_rows first (so degree-0 nodes are present),
-    then every edge. Returns (G, node_layer). Nodes carry 'layer3' (coarse
-    3-way grouping), the raw 'type_a' (5-way, incl. dual-typed
-    'protein,transcript'), and 'pathways' (frozenset parsed from
-    pathways_a, empty for unannotated nodes) as attributes; edges carry the
-    raw 'edge_type_c' (10-way) as an attribute."""
+    then every edge. Returns (G, node_layer). Nodes carry 'layer' (from
+    `layer_column`, validated against `layer_order`), the raw 'type_a'
+    (empty string if the column is absent), and 'pathways' (frozenset parsed
+    from pathways_a, empty if absent/unannotated) as attributes; edges carry
+    the raw 'edge_type_c'. The effective layer order is stored as
+    G.graph["layer_order"] so layouts can read it via layer_order(G).
+
+    Raises ValueError on a missing layer column, layer values outside
+    `layer_order` (or order entries absent from the data), or an edge
+    endpoint that is not a node -- all of which would otherwise surface as a
+    confusing KeyError deep inside some layout.
+    """
+    order = tuple(layer_order)
+    if len(set(order)) != len(order) or not order:
+        raise ValueError(f"layer order must be a non-empty list of distinct names, got {order}")
+    if node_rows and layer_column not in node_rows[0]:
+        raise ValueError(
+            f"nodes.tsv has no {layer_column!r} column (columns: {list(node_rows[0].keys())})"
+        )
     G = nx.Graph()
+    G.graph["layer_order"] = order
+    G.graph["layer_column"] = layer_column
     node_layer: dict[str, str] = {}
+    unknown: Counter = Counter()
     for row in node_rows:
         nid = row["id"]
-        layer = layer3(row["type_a"])
+        layer = (row.get(layer_column) or "").strip()
+        if layer not in order:
+            unknown[layer] += 1
         G.add_node(
             nid,
-            layer3=layer,
-            type_a=row["type_a"],
+            layer=layer,
+            type_a=row.get("type_a", ""),
             pathways=parse_pathways(row.get("pathways_a", "")),
         )
         node_layer[nid] = layer
+    if unknown:
+        raise ValueError(
+            f"{layer_column} values not in the layer order {order}: "
+            f"{dict(unknown)} (value -> node count); pass --layer-order listing every value"
+        )
+    present = set(node_layer.values())
+    absent = [layer for layer in order if layer not in present]
+    if absent:
+        raise ValueError(
+            f"layer order {order} names layer(s) with no nodes in {layer_column}: {absent}; "
+            f"values present: {sorted(present)}"
+        )
     for row in edge_rows:
-        G.add_edge(row["source"], row["target"], edge_type_c=row.get("edge_type_c", ""))
+        u, v = row["source"], row["target"]
+        if u not in G or v not in G:
+            raise ValueError(f"edge {u}-{v} references a node id missing from nodes.tsv")
+        G.add_edge(u, v, edge_type_c=row.get("edge_type_c", ""))
     return G, node_layer
 
 
@@ -260,7 +442,7 @@ def set_attraction_weight(
     attr: str = "fa_weight",
 ) -> None:
     """FA2/spring semantics: weight = attraction strength. Lower cross weight
-    spreads layers apart."""
+    spreads layers apart. "Cross" = endpoints in different layers."""
     for u, v, data in G.edges(data=True):
         data[attr] = within if node_layer[u] == node_layer[v] else cross
 
@@ -395,8 +577,8 @@ def place_isolated_ring_per_layer(
     radius_factor: float = ISOLATED_RING_FACTOR,
 ) -> dict[str, np.ndarray]:
     """For z-stacked layouts (fa2_1/fa2_2/fa2_3/fa2sep_1): places degree-0
-    nodes on a 2D ring around `xy`'s bounding circle, one ring per layer3
-    group, at that layer's fixed z."""
+    nodes on a 2D ring around `xy`'s bounding circle, one ring per layer,
+    at that layer's fixed z."""
     isolated_ids = list(isolated_ids)
     if not isolated_ids:
         return {}
@@ -448,7 +630,7 @@ def spectral_positions(
     `n_components` dims. A uniform epsilon background is added so
     disconnected pieces of H don't collapse to numerically-identical points
     (see method_distance_embedding.py's spectral_1 for why this matters).
-    `weighted=True` requires `node_layer` and down-weights cross-layer3
+    `weighted=True` requires `node_layer` and down-weights cross-layer
     edges via ATTRACTION_WITHIN/ATTRACTION_CROSS.
     """
     from sklearn.manifold import SpectralEmbedding
@@ -471,22 +653,50 @@ def spectral_positions(
     return {n: emb[idx[n]] for n in nodes}
 
 
+def prepare_seed_positions(
+    pos: dict[str, np.ndarray],
+    *,
+    target_rms: float | None = None,
+    jitter_fraction: float = SEED_JITTER_FRACTION,
+    seed: int = GLOBAL_SEED,
+) -> dict[str, np.ndarray]:
+    """Makes an embedding safe to use as a force-layout warm start: centres
+    it, rescales it to `target_rms` RMS radius (default
+    SEED_TARGET_RMS_PER_SQRT_N * sqrt(n)), and adds deterministic Gaussian
+    jitter (`jitter_fraction` * target_rms per coordinate) so coincident
+    points -- which make ForceAtlas2's repulsion divide by zero -- are
+    separated. Node order is sorted by int(id) so the jitter is reproducible."""
+    nodes = sorted(pos, key=lambda n: int(n))
+    arr = np.array([pos[n] for n in nodes], dtype=float)
+    if len(nodes) == 0:
+        return {}
+    arr = arr - arr.mean(axis=0)
+    rms = float(np.sqrt((arr**2).sum(axis=1).mean())) or 1.0
+    if target_rms is None:
+        target_rms = SEED_TARGET_RMS_PER_SQRT_N * math.sqrt(len(nodes))
+    arr = arr * (target_rms / rms)
+    rng = np.random.default_rng(seed)
+    arr = arr + rng.normal(0.0, jitter_fraction * target_rms, size=arr.shape)
+    return {n: arr[i] for i, n in enumerate(nodes)}
+
+
 def layer_z_stack(
     xy: dict[str, np.ndarray],
     node_layer: dict[str, str],
     *,
+    order: Iterable[str],
     fraction: float = Z_STACK_FRACTION,
 ) -> tuple[dict[str, np.ndarray], dict[str, float]]:
-    """Combines a 2D layout with a fixed z offset per layer3. Returns
-    (coords, z_by_layer) so callers can reuse z_by_layer for isolated-node
-    ring placement."""
+    """Combines a 2D layout with a fixed z plane per layer, planes stacked
+    in `order` (first = lowest z), `fraction` * xy-span apart and centred on
+    z=0 (3 layers -> -d, 0, +d). Returns (coords, z_by_layer) so callers can
+    reuse z_by_layer for isolated-node ring placement."""
     arr = np.array(list(xy.values()), dtype=float)
     span = max(
         float(arr[:, 0].max() - arr[:, 0].min()),
         float(arr[:, 1].max() - arr[:, 1].min()),
     )
-    d = fraction * span
-    z_by_layer = {"protein": -d, "bridge": 0.0, "metabolite": d}
+    z_by_layer = layer_axis_offsets(order, fraction * span)
     coords = {
         n: np.array([p[0], p[1], z_by_layer[node_layer[n]]]) for n, p in xy.items()
     }
@@ -533,10 +743,26 @@ class GraphData:
     node_layer: dict[str, str]
     node_rows: list[dict[str, str]]
     header: list[str]
+    edge_count: int = 0
 
 
-def load_graph(nodes_path: Path, edges_path: Path) -> GraphData:
+def load_graph(
+    nodes_path: Path,
+    edges_path: Path,
+    *,
+    layer_column: str = LAYER_COLUMN,
+    layer_order: Iterable[str] = LAYER_ORDER,
+) -> GraphData:
     header, node_rows = read_nodes_tsv(nodes_path)
     edge_rows = read_edges_tsv(edges_path)
-    G, node_layer = build_graph(node_rows, edge_rows)
-    return GraphData(G=G, node_layer=node_layer, node_rows=node_rows, header=header)
+    G, node_layer = build_graph(
+        node_rows, edge_rows, layer_column=layer_column, layer_order=layer_order
+    )
+    return GraphData(
+        G=G, node_layer=node_layer, node_rows=node_rows, header=header, edge_count=len(edge_rows)
+    )
+
+
+def parse_layer_order(raw: str) -> tuple[str, ...]:
+    """'transcript,protein,metabolite' -> ('transcript', 'protein', 'metabolite')."""
+    return tuple(x.strip() for x in raw.split(",") if x.strip())

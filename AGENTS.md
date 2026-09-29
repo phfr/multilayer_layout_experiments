@@ -1,4 +1,4 @@
-# AGENTS.md — ppicml layout generator
+# AGENTS.md — multilayer layout generator
 
 Machine-facing reference for making changes to this directory. For a
 human-facing description of what each layout *does*, see `README.md` — this
@@ -6,51 +6,84 @@ file is about *how the code is built* so you can extend it correctly.
 
 ## Scope
 
-This directory computes 3D node layouts for `public/data/ppicml/nodes.tsv`
-+ `edges.tsv` (a small protein-metabolite biological network) and writes
-them back into `nodes.tsv` as column triplets. It does not touch the
-frontend app; it only produces data the frontend already knows how to
-consume (see "Frontend contract" below). Entry point: `run_layouts.py`.
+This directory computes 3D node layouts for a multilayer biological network
+given as an **input folder** holding `nodes.tsv` + `edges.tsv`, and writes
+them into an **output folder** as column triplets appended to a copy of
+`nodes.tsv`. The input folder is never written to. It does not touch the
+viewer app; it only produces data the frontend already knows how to consume
+(see "Frontend contract" below). Entry point: `run_layouts.py`:
+
+```bash
+python3 run_layouts.py -i INPUT_DIR -o OUTPUT_DIR [--only a,b] [--layer-order t,p,m]
+```
+
+Output folder contents (see `common.prepare_output_dir`):
+
+- `nodes.tsv` — input columns + one `x_/y_/z_` triplet per layout. Seeded
+  by copying the input on first use; on a later run into the same folder it
+  is rebuilt as input columns + the layout columns already there (carried
+  over by node id), so `--only` runs accumulate and layouts that read
+  `fa2_1` back keep working. A different node-id set is refused.
+- `edges.tsv` — verbatim copy, so the folder is a complete dataset.
+- `layout_run_log.txt` — append-only; every run opens with a banner whose
+  first line is the exact command (`shlex.join(sys.argv)`), then interpreter,
+  cwd, input/output paths, graph stats, layer order, and the selected/skipped
+  layouts (`common.append_run_header`), followed by one entry per layout.
+
+Pointing `-o` at the input folder is allowed and degrades to in-place mode.
 
 ## Data model — verify before trusting these numbers
 
-Re-derive with `python3 run_layouts.py --dry-run` (prints node/edge/
-component counts) rather than hardcoding assumptions — this data can and
-does change (columns have been added mid-project before, e.g. `pathways_a`
-and the GO/KEGG/orphanet annotation columns arrived after the original 8).
+Re-derive with `python3 run_layouts.py -i DIR --dry-run` (prints node/edge/
+component counts, per-layer counts and which layouts would be skipped)
+rather than hardcoding assumptions — the data has been swapped wholesale
+once already (a 900-node protein/bridge/metabolite network with 10 edge
+types and pathway/GO annotation columns → the current one), and layouts
+that hardcoded the old layer names or edge-type counts all had to change.
+Treat layer names, edge-type vocabularies and annotation columns as
+**data-driven**, never as constants in a method file.
 
-As of this writing: **900 nodes, 1689 edges, 118 connected components**
-(one giant component of 745 nodes, 14 small components of 2-10 nodes, 103
-fully isolated/degree-0 nodes).
+As of this writing (`wwiznet_ppimetabolite/prepare/raw_input`): **263
+nodes, 317 edges, 1 connected component, 0 isolated nodes**.
 
-`nodes.tsv` non-layout columns (15): `id, name, degree_n, type_a,
-type_simple_c, protein_id_c, transcript_id_c, metabolite_id_c, GO_BP_a,
-GO_CC_a, GO_MF_a, Phenotype_Ontology_a, KEGG_a, orphanet_a, pathways_a`.
+`nodes.tsv` columns (8): `id, name, degree_n, layer_c, type_a,
+protein_id_c, transcript_id_c, metabolite_id_c`.
 
-- `type_a` (5-way, use for fine-grained grouping): `protein`, `transcript`,
-  `protein,transcript` (21 dual-typed nodes), `bridge`, `metabolite`.
-- `layer3` (3-way coarsening, computed by `common.layer3()`, NOT a real
-  column): `protein` (folds in transcript + dual-typed), `bridge`,
-  `metabolite`. Most existing layouts use `layer3`; a few (`hive5_1`,
-  `domaintouch_1`) use the finer `type_a` on purpose.
-- `_a`-suffixed columns are comma-separated arrays (frontend convention,
-  see `src/data/ColumnTypes.ts`). Only `pathways_a` is currently wired into
-  any layout (`method_pathway.py`) — 428/900 nodes annotated, **zero
-  metabolites** (gene-centric annotation). `GO_BP_a`/`KEGG_a`/etc. are
-  present in the data but unused; the same TF-IDF + neighbor-propagation
-  pattern in `method_pathway.py` would extend to them if asked.
+- **`layer_c` is the layer column** (`common.LAYER_COLUMN`). Values:
+  `transcript` (141), `protein` (90), `metabolite` (32). The stacking order
+  — bottom/innermost first — is `common.LAYER_ORDER` =
+  `("transcript", "protein", "metabolite")`, overridable per run with
+  `--layer-order`. `build_graph` refuses a layer value not in the order and
+  an order entry with no nodes, so the two always agree. The effective order
+  is stored on the graph as `G.graph["layer_order"]`; **method code must read
+  it via `c.layer_order(G)`**, never spell layer names out.
+- `type_a` is a finer per-node type (currently one value per node, e.g.
+  `protein_bridge`, `transcript_differentially_expressed`; 5 values). Loaded
+  as node attr `type_a` (`""` if the column is absent). Used only by
+  `hive5_1` (one spoke per value) and `landscape_1` (one-hot feature block).
+- `pathways_a` (optional, absent in the current data) is the only annotation
+  column any layout consumes. `fa2pathway_1` / `pathway_landscape_1` declare
+  `requires_columns=("pathways_a",)` on their `RunSpec` and are **skipped
+  with a `SKIPPED` log entry** (not failed) when it is absent or empty.
+  `_a`-suffixed columns are comma-separated arrays (frontend convention).
 - `degree_n` is a precomputed column but **nothing in this codebase reads
   it** — every layout uses `G.degree(n)` from the live graph built by
   `common.build_graph()`. If `nodes.tsv`'s `degree_n` and the live graph
   ever disagree, the live graph wins everywhere.
+- Node ids are integers-as-strings; helpers sort by `int(id)`.
 
-`edges.tsv` columns: `source, target, edge_type_c, type_simple_c,
-edge_type_agg_c, test` (`test` is an unused legacy column). Only
-`edge_type_c` (10 distinct values, e.g. `protein-bridge`,
-`metabolite-metabolite`) is loaded onto the graph.
+`edges.tsv` columns: `source, target, edge_type_c`. `edge_type_c` (5 distinct
+values: `protein-protein`, `transcript-transcript`, `metabolite-metabolite`,
+`protein-metabolite`, `transcript-metabolite`) is loaded onto the graph.
+Note there are **no transcript-protein edges**: both non-metabolite layers
+connect to each other only through metabolites, which matters for any
+layout that fixes the outer layers and relaxes the middle one
+(`n2vlayered_1`). An edge whose endpoint is not a node id is an error.
 
-Both files are **CRLF-terminated, tab-separated, no BOM**. Preserve this —
-see `common.write_layout_columns`.
+Both files are **tab-separated, no BOM**. The current input is
+LF-terminated (the previous dataset was CRLF); `write_layout_columns`
+detects and preserves whichever the file already uses
+(`common.detect_line_terminator`).
 
 ## Architecture
 
@@ -72,8 +105,8 @@ method_metapath.py      metapath_1
 method_ensemble.py      ensemble_1
 method_pathway.py       fa2pathway_1(*), pathway_landscape_1
 run_layouts.py          CLI + REGISTRY (the only place layouts are wired up)
-evaluate_umap_params.py standalone grid-search tool, not part of the run pipeline
-layout_run_log.txt      generated (in public/data/ppicml/, not this dir) — append-only log
+evaluate_umap_params.py standalone grid-search tool (-i INPUT_DIR, read-only), not part of the run pipeline
+OUTPUT_DIR/layout_run_log.txt   generated — append-only log, lives next to the output nodes.tsv
 ```
 (*) `fa2pathway_1` is registered under `method_pathway.py`, not
 `method_forceatlas.py`, despite the name — pathway-related layouts live
@@ -100,12 +133,14 @@ def run_<base_name>(G: nx.Graph, node_layer: dict[str, str], nodes_path: Path
 ```
 
 - `G` — the full graph from `common.build_graph()`: every node from
-  `nodes.tsv` present (including degree-0 ones), node attrs `layer3`,
-  `type_a`, `pathways` (frozenset); edge attr `edge_type_c`.
-- `node_layer` — `{node_id: layer3}`, same as `nx.get_node_attributes(G,
-  'layer3')`, passed separately for convenience/history.
-- `nodes_path` — only used by layouts that read back already-computed
-  columns from the live file (e.g. `method_centrality.py`'s
+  `nodes.tsv` present (including degree-0 ones), node attrs `layer`,
+  `type_a`, `pathways` (frozenset); edge attr `edge_type_c`; graph attrs
+  `layer_order` / `layer_column` (read via `c.layer_order(G)`).
+- `node_layer` — `{node_id: layer}`, same as `nx.get_node_attributes(G,
+  'layer')`, passed separately for convenience/history.
+- `nodes_path` — the **output** `nodes.tsv` (already seeded from the input
+  before the first layout runs). Only used by layouts that read back
+  already-computed columns (e.g. `method_centrality.py`'s
   `_get_or_compute_fa2_xy`, which reuses `fa2_1`'s xy if present).
 - Returns `coords` (must have an entry for **every** node in `G`, values
   are anything unpackable as 3 floats — tuple, list, or `np.ndarray` all
@@ -121,9 +156,11 @@ crash partway through a full run still leaves prior layouts persisted.
 
 ## Disconnected-graph handling — pick the right pattern
 
-The graph has 155 nodes outside the giant component (103 isolated + 52 in
-small components). Every layout must place them somehow; there are two
-established patterns — **don't invent a third without a reason**:
+The current input is a single connected component, but the previous one
+had 155 nodes outside the giant component (103 isolated + 52 in small
+components) and the next one may again. Every layout must place such nodes
+somehow; there are two established patterns — **don't invent a third
+without a reason**:
 
 **Pattern A ("fa2 family")** — used when the base algorithm tolerates
 disconnected input natively (ForceAtlas2, spring layout do):
@@ -156,14 +193,22 @@ non-degenerate feature vector directly, and only fall back to
 back — see that file for the pattern if extending it to `GO_BP_a`/`KEGG_a`).
 
 Never skip disconnected-node handling "because it's a small effect" — every
-layout in this repo has one, and the frontend renders all 900 nodes
-regardless.
+layout in this repo has one, and the frontend renders every node
+regardless. Per-layer sub-layouts have the same issue one level down: a
+layer's induced subgraph can be tiny or fragmented even when the whole
+graph is connected (`n2vlayered_1` falls back to a spring layout for a slab
+whose giant component has fewer than `MIN_NODES_FOR_UMAP` nodes).
 
 ## `common.py` helper reference
 
 | Helper | Use for |
 |---|---|
-| `layer3(type_a)` / `build_graph(...)` / `load_graph(...)` | Graph construction (call once via `load_graph`, not per-layout) |
+| `build_graph(...)` / `load_graph(..., layer_order=)` / `parse_layer_order(s)` | Graph construction (call once via `load_graph`, not per-layout); validates `layer_c` against the order |
+| `layer_order(G)` | The run's layer stacking order, first = bottom/innermost — **the only sanctioned way for a method to learn layer names** |
+| `layer_axis_offsets(order, step)` | Signed, zero-centred offsets along one axis per layer (3 layers → `-step, 0, +step`) |
+| `prepare_output_dir(input_dir, output_dir)` | Seeds/rebuilds the output `nodes.tsv`, copies `edges.tsv`, returns the output paths (`OutputPaths`) |
+| `append_run_header(log, argv=, details=)` | The per-run log banner (exact command line first) |
+| `detect_line_terminator(path)` | `"\r\n"` or `"\n"`, so rewrites keep the input's convention |
 | `set_attraction_weight(G, node_layer, ...)` | FA2/spring edge weight: **higher = closer**. Writes to `G` edge attr `fa_weight` by default |
 | `set_distance_weight(G, node_layer, ...)` | KK/MDS-hop edge weight: **higher = farther**. Opposite semantics from above — don't mix them up |
 | `sorted_components(H)` / `giant_component_nodes(H)` / `isolated_nodes(H)` | Connectivity queries, deterministic ordering (size desc, then min id) |
@@ -173,9 +218,9 @@ regardless.
 | `deterministic_fallback_shell(pos, remaining, G)` | Pattern B's placement step (see above) |
 | `place_isolated_ring_per_layer(...)` / `place_isolated_sphere_shell(...)` | Pattern A's placement step (see above) |
 | `spectral_positions(H, n_components, ...)` | Shared spectral embedding used by both `spectral_1/2` and `fa2spectral_1`'s warm-start seed |
-| `layer_z_stack(xy, node_layer)` | Turns a 2D layout into z-stacked 3D (protein=-D, bridge=0, metabolite=+D, D from that run's own xy spread) — returns `z_by_layer` too, for `place_isolated_ring_per_layer` |
+| `layer_z_stack(xy, node_layer, order=c.layer_order(G))` | Turns a 2D layout into z-stacked 3D: one plane per layer in `order`, `Z_STACK_FRACTION` × that run's own xy spread apart, centred on z=0 — returns `z_by_layer` too, for `place_isolated_ring_per_layer` |
 | `elapsed_spinner(desc)` | Context manager: nested tqdm bar showing elapsed time for a layout with no native progress hooks — used by default for every layout now (see "Progress bar" below) |
-| `read_nodes_tsv` / `read_edges_tsv` / `write_layout_columns` / `append_log_entry` | TSV IO — always CRLF, always atomic write (temp file + `os.replace`) |
+| `read_nodes_tsv` / `read_edges_tsv` / `write_layout_columns` / `append_log_entry` | TSV IO — line terminator preserved from the file, always atomic write (temp file + `os.replace`) |
 | `validate_base_name(name)` | Called automatically by `write_layout_columns` and `run_layouts.py`'s registry validation — raises if `name` ends in a reserved suffix |
 
 Constants live at the top of `common.py`, each with a comment explaining
@@ -186,10 +231,11 @@ different value in a method file.
 
 ## Frontend contract (don't break this)
 
-The viewer app (elsewhere in this repo, `src/data/LayoutDetection.ts`)
+The viewer app (a separate repo, `src/data/LayoutDetection.ts`)
 auto-detects a layout purely from the existence of all three of
 `x_<name>`, `y_<name>`, `z_<name>` in `nodes.tsv`'s header — no manifest,
-no registration on the frontend side. Consequences:
+no registration on the frontend side. Point it at the **output** folder.
+Consequences:
 
 - `<name>` (the `base_name`) must not end in `_c`, `_n`, `_a`, `_kv`,
   `_c_kv`, or `_norm` — those suffixes make the frontend infer a
@@ -202,7 +248,8 @@ no registration on the frontend side. Consequences:
   `src/windows/LayoutCalcWindow.ts`).
 - The original non-layout columns must never be reordered or removed —
   `write_layout_columns` only appends new `x_/y_/z_` columns at the end and
-  never touches anything else.
+  never touches anything else. `layer_c` itself is a categorical (`_c`)
+  attribute on the frontend side, which is exactly what we want.
 
 ## Adding a new layout
 
@@ -218,9 +265,15 @@ no registration on the frontend side. Consequences:
    description>")` to `run_layouts.py`'s `REGISTRY` list. Cheap/deterministic
    layouts go earlier in the list (so a partial/interrupted run still
    yields something), expensive ones (node2vec-based, ~40-120s each) later.
-4. Smoke-test in isolation first: `python3 run_layouts.py --only
-   <base_name> --no-progress` (see "Testing" below for the full checklist).
-5. Update `README.md`'s method table (keep it alphabetically sorted by
+   If it needs an optional column, declare `requires_columns=("col",)` so
+   it is skipped (not failed) on inputs without it.
+4. Never hardcode layer names, layer counts, or edge-type vocabularies:
+   use `c.layer_order(G)` and `Counter` over `edge_type_c` so the layout
+   survives the next dataset swap.
+5. Smoke-test in isolation first: `python3 run_layouts.py -i IN -o
+   SCRATCH_OUT --only <base_name> --no-progress` (see "Testing" below for
+   the full checklist).
+6. Update `README.md`'s method table (keep it alphabetically sorted by
    `base_name`) and the file list at the bottom.
 
 ## Testing / verification checklist
@@ -228,32 +281,36 @@ no registration on the frontend side. Consequences:
 Run after adding or changing any layout:
 
 ```bash
-python3 run_layouts.py --dry-run                    # graph loads, registry validates
-python3 run_layouts.py --only <base_name> --no-progress   # isolated smoke test
+IN=/path/to/input_dir; OUT=/tmp/layout_smoke
+python3 run_layouts.py -i "$IN" --dry-run                        # graph loads, registry validates
+python3 run_layouts.py -i "$IN" -o "$OUT" --only <base_name> --no-progress   # isolated smoke test
 ```
 
 Then verify the write, e.g.:
 
 ```python
-import sys; sys.path.insert(0, "utils/ppicml_layouts")
+import math
 import common as c
-header, rows = c.read_nodes_tsv("public/data/ppicml/nodes.tsv")
-assert len(rows) == 900                                   # row count unchanged
-assert not (len(header) != len(set(header)))               # no duplicate columns
+header_in, rows_in = c.read_nodes_tsv(f"{IN}/nodes.tsv")
+header, rows = c.read_nodes_tsv(f"{OUT}/nodes.tsv")
+assert [r["id"] for r in rows] == [r["id"] for r in rows_in]   # rows unchanged, same order
+assert header[:len(header_in)] == header_in                     # input columns untouched, in place
+assert len(header) == len(set(header))                          # no duplicate columns
 bases = c.get_existing_layout_bases(header)
-assert "<base_name>" in bases                               # frontend would detect it
+assert "<base_name>" in bases                                   # frontend would detect it
 bad = [(r["id"], col) for r in rows for col in header
        if col.startswith(("x_", "y_", "z_")) and not math.isfinite(float(r[col]))]
-assert not bad                                              # no NaN/Inf
+assert not bad                                                  # no NaN/Inf
+assert c.detect_line_terminator(f"{OUT}/nodes.tsv") == c.detect_line_terminator(f"{IN}/nodes.tsv")
 ```
 
 Also worth a spot-check for genuinely new signals: confirm the column
-isn't degenerate (e.g. `domaintouch_1`'s z has exactly 4 distinct values by
-design — check the actual `nunique` matches what the metric *should*
-produce, not just "some values").
+isn't degenerate (e.g. `domaintouch_1`'s z has at most as many distinct
+values as there are layers, by design — check the actual `nunique` matches
+what the metric *should* produce, not just "some values").
 
-`file public/data/ppicml/nodes.tsv` should still report **CRLF line
-terminators**, no BOM, after any write.
+The input folder must be byte-identical after a run (`git status` / `cmp`
+against a copy) — nothing in this directory may write there.
 
 ## Progress bar architecture
 
@@ -304,6 +361,17 @@ conflicts (checked each time). See `README.md`'s Dependencies section for
 the full `pip install` line.
 
 ## Other gotchas learned the hard way
+
+- **Never feed a raw spectral embedding to ForceAtlas2 as a warm start.**
+  Structurally equivalent nodes (same neighbour set) get numerically
+  identical spectral coordinates (min pairwise distance ~1e-17 observed on
+  the current data), and networkx's FA2 repulsion is 1/d², so the layout
+  explodes to ~1e8 units and prints `RuntimeWarning: invalid value
+  encountered in divide` from `networkx/drawing/layout.py`. Pass any seed
+  through `c.prepare_seed_positions()` (rescale + deterministic jitter)
+  first — that is what `fa2spectral_1` does. A tell-tale sign in the
+  verification spot-check is a span many orders of magnitude larger than
+  the unseeded `fa2_1`.
 
 - **Don't run two node2vec/numba-heavy layouts concurrently** (e.g. two
   background `run_layouts.py --only ...` invocations at once, or a manual

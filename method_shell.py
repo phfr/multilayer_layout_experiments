@@ -1,9 +1,9 @@
-"""Concentric shell/sphere layout: protein/bridge/metabolite each get their
-own spherical shell (radius scaled by node count), with nodes placed on a
-deterministic Fibonacci-sphere spiral -- no force simulation, so it can't
-fail or explode on the 118-component graph. Nodes are ordered within each
-layer by (connected-component rank, then id) so same-component nodes land
-angularly close together.
+"""Concentric shell/sphere layout: each layer (in --layer-order, first =
+innermost) gets its own spherical shell (radius scaled by node count), with
+nodes placed on a deterministic Fibonacci-sphere spiral -- no force
+simulation, so it can't fail or explode on a many-component graph. Nodes
+are ordered within each layer by (connected-component rank, then id) so
+same-component nodes land angularly close together.
 """
 
 from __future__ import annotations
@@ -13,18 +13,8 @@ from collections import Counter
 
 import common as c
 
-# Bands over the rarest edge_type_c a node touches: (0,50) covers the 3
-# rarest of the 10 known edge types (metabolite-protein=28,
-# metabolite-transcript=34, transcript-bridge=43); (50,120) covers the
-# bridge-touching mid-rarity types (107/110/119); (120,200) covers
-# protein-transcript/protein-protein (152/187); (200,inf) covers only nodes
-# whose ALL edges are one of the two most common types
-# (transcript-transcript=409, metabolite-metabolite=500). Isolated nodes (no
-# incident edges) get their own outermost band.
-RARITY_BANDS = ((0, 50), (50, 120), (120, 200), (200, float("inf")))
 
-
-def _shell_layout(G, node_layer, *, order: tuple[str, str, str]):
+def _shell_layout(G, node_layer, *, order: tuple[str, ...]):
     coords = {}
     prev_r = 0.0
     radii = {}
@@ -48,11 +38,11 @@ def _shell_layout(G, node_layer, *, order: tuple[str, str, str]):
 
 
 def run_shell_1(G, node_layer, nodes_path):
-    order = ("protein", "bridge", "metabolite")
+    order = c.layer_order(G)
     coords, radii = _shell_layout(G, node_layer, order=order)
     meta = dict(
-        method="Concentric shell layout: protein (inner) / bridge (mid) / metabolite (outer)",
-        library_call="deterministic Fibonacci-sphere placement per layer3 (no simulation)",
+        method=f"Concentric shell layout, inner -> outer: {' / '.join(order)}",
+        library_call="deterministic Fibonacci-sphere placement per layer (no simulation)",
         params={
             "order": order,
             "shell_r_base": c.SHELL_R_BASE,
@@ -70,11 +60,11 @@ def run_shell_1(G, node_layer, nodes_path):
 
 
 def run_shell_2(G, node_layer, nodes_path):
-    order = ("metabolite", "bridge", "protein")
+    order = tuple(reversed(c.layer_order(G)))
     coords, radii = _shell_layout(G, node_layer, order=order)
     meta = dict(
-        method="Concentric shell layout: metabolite (inner) / bridge (mid) / protein (outer)",
-        library_call="deterministic Fibonacci-sphere placement per layer3 (no simulation)",
+        method=f"Concentric shell layout (reversed), inner -> outer: {' / '.join(order)}",
+        library_call="deterministic Fibonacci-sphere placement per layer (no simulation)",
         params={
             "order": order,
             "shell_r_base": c.SHELL_R_BASE,
@@ -89,11 +79,20 @@ def run_shell_2(G, node_layer, nodes_path):
 
 def run_shell_rarity_1(G, node_layer, nodes_path):
     """Same deterministic-geometry mechanism as shell_1/shell_2, but shell
-    assignment is by rarity band (the rarest edge_type_c a node touches),
-    not layer3 -- a self-contained new grouping principle: rare cross-domain
-    connectors form the innermost shell regardless of which layer they
-    belong to, common-only-touching nodes form the outer shells."""
+    assignment is by the rarest edge_type_c a node touches, not its layer --
+    a self-contained grouping principle: rare cross-domain connectors form
+    the innermost shell regardless of which layer they belong to, nodes
+    touching only common edge types form the outer shells. Bands are
+    data-driven: one per distinct edge_type_c frequency, rarest first (edge
+    types with equal counts share a band); isolated nodes (no incident
+    edges) get their own outermost band."""
     type_counts = Counter(data.get("edge_type_c", "") for _, _, data in G.edges(data=True))
+    distinct_counts = sorted(set(type_counts.values()))
+    band_of_count = {cnt: i for i, cnt in enumerate(distinct_counts)}
+    bands = {
+        i: sorted(et for et, cnt in type_counts.items() if cnt == count)
+        for count, i in band_of_count.items()
+    }
 
     def rarest_count(n):
         incident = [G.edges[n, nb].get("edge_type_c", "") for nb in G.neighbors(n)]
@@ -101,17 +100,11 @@ def run_shell_rarity_1(G, node_layer, nodes_path):
             return None
         return min(type_counts[et] for et in incident)
 
-    n_bands = len(RARITY_BANDS) + 1  # + 1 for isolated nodes' own outermost band
+    n_bands = len(distinct_counts) + 1  # + 1 for isolated nodes' own outermost band
     band_of: dict[str, int] = {}
     for n in G.nodes():
         rc = rarest_count(n)
-        if rc is None:
-            band_of[n] = n_bands - 1
-            continue
-        for i, (lo, hi) in enumerate(RARITY_BANDS):
-            if lo <= rc < hi:
-                band_of[n] = i
-                break
+        band_of[n] = n_bands - 1 if rc is None else band_of_count[rc]
 
     coords = {}
     prev_r = 0.0
@@ -140,11 +133,11 @@ def run_shell_rarity_1(G, node_layer, nodes_path):
     meta = dict(
         method=(
             "Concentric shells by rarity band: shell = rarest edge_type_c a node "
-            "touches (innermost = touches a rare cross-domain type), not layer3"
+            "touches (innermost = touches the rarest type), not layer"
         ),
         library_call="deterministic Fibonacci-sphere placement per rarity band (no simulation)",
         params={
-            "bands": RARITY_BANDS,
+            "bands": {i: f"{types} (count={distinct_counts[i]})" for i, types in bands.items()},
             "shell_r_base": c.SHELL_R_BASE,
             "shell_min_gap_factor": c.SHELL_MIN_GAP_FACTOR,
             "band_sizes": band_sizes,

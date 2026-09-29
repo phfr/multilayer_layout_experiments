@@ -2,9 +2,9 @@
 probability is biased by edge_type_c (domain continuity) rather than being
 purely topology-driven -- node2vec's p/q only control BFS/DFS exploration
 bias, never look at edge TYPE at all. Walks here are SAME_DOMAIN_BOOST times
-more likely to continue along a same-domain edge (protein-protein,
-transcript-transcript, metabolite-metabolite, bridge-bridge) than to cross
-domains, so the resulting embedding reflects domain-continuity structure
+more likely to continue along a same-domain edge (an edge_type_c whose
+two halves match, e.g. protein-protein, transcript-transcript,
+metabolite-metabolite) than to cross domains, so the resulting embedding reflects domain-continuity structure
 that plain node2vec can't see. The node2vec package doesn't expose
 per-edge-type biasing, so this uses a small custom weighted-walk generator
 feeding directly into gensim's Word2Vec (the same training call node2vec

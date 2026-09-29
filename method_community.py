@@ -1,6 +1,6 @@
 """Louvain community detection + meta-layout + local sublayout per
 community. Structurally different grouping principle from shell_*/fa2sep_1
-(which use the a priori layer3 label): communities are detected purely from
+(which use the a priori layer label): communities are detected purely from
 graph topology (modularity optimization), so a community can span multiple
 layers if they're densely interconnected -- reveals emergent structure the
 layer-based layouts can't.
@@ -74,8 +74,8 @@ def run_community_1(G, node_layer, nodes_path):
 
 def run_community_shellz_1(G, node_layer, nodes_path):
     """Surgical blend: community_1's real xy (force-computed, encodes real
-    topology) + shell_1's radius-by-layer3 formula, reused as a signed z
-    elevation applied per COMMUNITY's predominant layer3 (not per node). No
+    topology) + shell_1's radius-by-layer formula, reused as a signed z
+    elevation applied per COMMUNITY's predominant layer (not per node). No
     Procrustes alignment is needed -- this reuses shell_1's radius FORMULA,
     not its literal coordinates, so there's no coordinate-frame mismatch to
     resolve. Result: "communities sorted by predominant measurement layer",
@@ -89,10 +89,17 @@ def run_community_shellz_1(G, node_layer, nodes_path):
     for n, cid in partition.items():
         members_by_community[cid].append(n)
 
+    # Signed elevation per layer: shell_1's radius formula (SHELL_R_BASE *
+    # sqrt(layer size)) times a sign/scale from the layer's position in
+    # --layer-order (3 layers -> -1, 0, +1; first layer lowest).
     layer_counts = Counter(node_layer.values())
-    protein_r = c.SHELL_R_BASE * math.sqrt(layer_counts.get("protein", 1))
-    metabolite_r = c.SHELL_R_BASE * math.sqrt(layer_counts.get("metabolite", 1))
-    z_by_layer = {"protein": -protein_r, "bridge": 0.0, "metabolite": metabolite_r}
+    order = c.layer_order(G)
+    direction = c.layer_axis_offsets(order, 1.0)
+    max_abs = max(abs(v) for v in direction.values()) or 1.0
+    z_by_layer = {
+        layer: (direction[layer] / max_abs) * c.SHELL_R_BASE * math.sqrt(layer_counts.get(layer, 1))
+        for layer in order
+    }
 
     n_pure = 0
     n_mixed = 0
@@ -112,18 +119,18 @@ def run_community_shellz_1(G, node_layer, nodes_path):
     meta = dict(
         method=(
             "Surgical blend: community_1's xy (real force-computed topology) + "
-            "shell_1's radius-by-layer3 formula reused as a signed z elevation, "
-            "applied per COMMUNITY's predominant layer3 (not per node)"
+            "shell_1's radius-by-layer formula reused as a signed z elevation, "
+            "applied per COMMUNITY's predominant layer (not per node)"
         ),
-        library_call="community.best_partition(G) -> mode(layer3) per community -> z_by_layer lookup",
+        library_call="community.best_partition(G) -> mode(layer) per community -> z_by_layer lookup",
         params={
             "z_by_layer": {k: round(v, 4) for k, v in z_by_layer.items()},
             "seed": c.GLOBAL_SEED,
         },
         weighting_desc="none",
         fallback_notes=(
-            f"{len(members_by_community)} communities: {n_pure} single-layer3-only, "
-            f"{n_mixed} mixed-layer3 (z assigned by majority vote -- a lossy "
+            f"{len(members_by_community)} communities: {n_pure} single-layer-only, "
+            f"{n_mixed} mixed-layer (z assigned by majority vote -- a lossy "
             f"simplification for genuinely mixed communities, which is the whole "
             f"point of Louvain finding them)"
         ),

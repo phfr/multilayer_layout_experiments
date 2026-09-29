@@ -14,15 +14,6 @@ import networkx as nx
 
 import common as c
 
-_DOMAIN_VALUES = {"protein", "transcript", "bridge", "metabolite"}
-
-
-def _domains_of(type_a: str) -> set:
-    if type_a == "protein,transcript":
-        return {"protein", "transcript"}
-    return {type_a} if type_a in _DOMAIN_VALUES else set()
-
-
 def _get_or_compute_fa2_xy(G, nodes_path):
     header, rows = c.read_nodes_tsv(nodes_path)
     if "x_fa2_1" in header and "y_fa2_1" in header:
@@ -79,18 +70,18 @@ def run_topobet_1(G, node_layer, nodes_path):
 
 
 def _domain_touch_count(G: nx.Graph) -> dict[str, int]:
-    """# of distinct domains (protein/transcript/bridge/metabolite) a node's
-    own type_a plus its 1-hop neighborhood collectively touch (1-4). Catches
-    low-degree nodes that quietly bridge multiple domains -- a signal
-    neither type_a alone nor centrality alone expresses: a protein-only node
-    adjacent to bridge, transcript, and metabolite neighbors ranks as a
-    strong connector even though its own type_a is single-domain."""
+    """# of distinct layers (the layer_c domains, e.g. transcript / protein /
+    metabolite) a node's own layer plus its 1-hop neighborhood collectively
+    touch (1 .. number of layers). Catches low-degree nodes that quietly
+    bridge multiple layers -- a signal neither the layer label alone nor
+    centrality alone expresses: a protein node adjacent to transcript and
+    metabolite neighbors ranks as a strong connector even at degree 2."""
     counts: dict[str, int] = {}
     for n in G.nodes():
-        domains = set(_domains_of(G.nodes[n].get("type_a", "")))
+        domains = {G.nodes[n]["layer"]}
         for nb in G.neighbors(n):
-            domains |= _domains_of(G.nodes[nb].get("type_a", ""))
-        counts[n] = len(domains) or 1
+            domains.add(G.nodes[nb]["layer"])
+        counts[n] = len(domains)
     return counts
 
 
@@ -99,15 +90,14 @@ def run_domaintouch_1(G, node_layer, nodes_path):
         G, node_layer, nodes_path,
         metric_name="domain_touch_count",
         metric_fn=_domain_touch_count,
-        library_call="custom: |{type_a domains of node} union {type_a domains of its neighbors}|",
+        library_call="custom: |{layer of node} union {layers of its neighbors}|",
     )
 
 
 def _rarest_incident_edge_score(G: nx.Graph) -> dict[str, float]:
     """z-score per node = -ln(rarest_incident_edge_type_count / total_edges):
-    a node touching a rare edge_type_c (e.g. one of the 28 metabolite-protein
-    edges) scores high even at low degree; a hub whose many edges are all a
-    common type (e.g. metabolite-metabolite) scores low despite high degree
+    a node touching a rare edge_type_c scores high even at low degree; a
+    hub whose many edges are all of a common type scores low despite high degree
     -- the opposite signal from topodeg_1/topobet_1."""
     type_counts = Counter(data.get("edge_type_c", "") for _, _, data in G.edges(data=True))
     total = sum(type_counts.values()) or 1
