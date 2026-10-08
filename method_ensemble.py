@@ -34,7 +34,7 @@ def _center_scale(coords_dict: dict[str, tuple], nodes: list[str]) -> np.ndarray
 
 
 def run_ensemble_1(G, node_layer, nodes_path):
-    nodes = sorted(G.nodes(), key=lambda n: int(n))
+    nodes = sorted(G.nodes(), key=c.node_key)
 
     fa_coords, _ = m_fa2.run_fa23d_1(G, node_layer, nodes_path)
     mds_coords, _ = m_dist.run_mds_1(G, node_layer, nodes_path)

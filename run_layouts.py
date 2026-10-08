@@ -10,6 +10,8 @@ Usage:
     python run_layouts.py --list                                  # print the registry, no reads/writes
     python run_layouts.py -i INPUT_DIR --dry-run                  # build the graph, validate, no writes
     python run_layouts.py -i IN -o OUT --layer-order transcript,protein,metabolite
+    python run_layouts.py -i IN -o OUT --layer-column tissue_c --type-column none \
+        --edge-type-column interaction_c                       # a dataset with other column names
 
 INPUT_DIR must contain nodes.tsv and edges.tsv and is never written to.
 OUTPUT_DIR (created if missing) receives:
@@ -17,8 +19,15 @@ OUTPUT_DIR (created if missing) receives:
     edges.tsv           verbatim copy of the input, so the folder is self-contained
     layout_run_log.txt  append-only log; every run opens with the exact command line
 
-Node layers come from the `layer_c` column; --layer-order sets the stacking
-order (first = bottom / innermost) used by every layer-aware layout.
+Which column plays which role is configurable (see "input columns" in
+--help): the node id, layer, optional type and pathway columns of nodes.tsv
+and the source / target / optional edge-type columns of edges.tsv. Defaults
+match the wwiznet export (id, layer_c, type_a, pathways_a, source, target,
+edge_type_c). --layer-order sets the layer stacking order (first = bottom /
+innermost) used by every layer-aware layout; by default the layers are
+stacked by descending node count (ties by first appearance in nodes.tsv),
+and the effective order is printed and logged. Layouts that need an
+optional role the input cannot fill are skipped (logged as SKIPPED).
 """
 
 from __future__ import annotations
@@ -66,11 +75,14 @@ class RunSpec:
     base_name: str
     func: Callable
     description: str
-    # nodes.tsv columns this layout needs (present AND non-empty for at least
-    # one node). A layout whose requirements the input doesn't meet is skipped
-    # with a SKIPPED log entry instead of failing the run -- e.g. the two
-    # pathways_a-driven layouts on a dataset without that annotation.
-    requires_columns: tuple[str, ...] = ()
+    # Optional column ROLES this layout needs ("type", "pathways",
+    # "edge_type" -- see common.ColumnSpec), each of which must have a column
+    # configured, present, and non-empty for at least one row. A layout whose
+    # requirements the input doesn't meet is skipped with a SKIPPED log entry
+    # instead of failing the run -- e.g. the two pathway-driven layouts on a
+    # dataset without that annotation. Roles, not column names: the user maps
+    # roles to their dataset's columns with the --*-column flags.
+    requires: tuple[str, ...] = ()
     # Reserved: True would skip the elapsed-time spinner for a method that prints
     # its own real, tqdm-aware progress. Not used by anything currently -- node2vec
     # (quiet=True) and UMAP/openTSNE/PHATE/PaCMAP (verbose=False) are all silenced
@@ -78,14 +90,8 @@ class RunSpec:
     # terminal instead of being buried by raw (non-tqdm-aware) library output.
     native_progress: bool = False
 
-    def missing_requirements(self, header: list[str], rows: list[dict[str, str]]) -> list[str]:
-        missing = []
-        for col in self.requires_columns:
-            if col not in header:
-                missing.append(f"column {col!r} absent")
-            elif not any((row.get(col) or "").strip() for row in rows):
-                missing.append(f"column {col!r} empty for every node")
-        return missing
+    def missing_requirements(self, data: c.GraphData) -> list[str]:
+        return data.missing_role_columns(self.requires)
 
 
 REGISTRY: list[RunSpec] = [
@@ -116,7 +122,7 @@ REGISTRY: list[RunSpec] = [
     RunSpec("isomap_1", m_dist.run_isomap_1, "Isomap on giant component's hop-distance matrix"),
     RunSpec("hyp_1", m_hyp.run_hyp_1, "Hyperbolic-radius layout (r=1-tanh(degree/beta)), layer-banded"),
     RunSpec("hive3_1", m_hive.run_hive3_1, "Hive-plot-style layout, one spoke per layer"),
-    RunSpec("hive5_1", m_hive.run_hive5_1, "Hive-plot-style layout, one spoke per raw type_a value", requires_columns=("type_a",)),
+    RunSpec("hive5_1", m_hive.run_hive5_1, "Hive-plot-style layout, one spoke per value of the type column", requires=("type",)),
     RunSpec("community_1", m_community.run_community_1, "Louvain community meta-layout + local sublayout"),
     RunSpec("community_shellz_1", m_community.run_community_shellz_1, "community_1 xy + shell_1 z-formula by predominant layer"),
     RunSpec("n2vbal_phate_1", m_n2v.run_n2vbal_phate_1, "node2vec (p=1,q=1) + PHATE(3D)"),
@@ -133,24 +139,24 @@ REGISTRY: list[RunSpec] = [
     RunSpec("landscape_1", m_landscape.run_landscape_1, "VRNetzer-style functional landscape (feature-matrix UMAP)"),
     RunSpec("rwr_1", m_landscape.run_rwr_1, "Random-walk-with-restart feature landscape (personalized PageRank + UMAP)"),
     RunSpec("paga_1", m_paga.run_paga_1, "PAGA-style two-level coarse (Louvain meta-graph) + fine (spring) layout"),
-    RunSpec("metapath_1", m_metapath.run_metapath_1, "Domain-continuity-biased random walks + Word2Vec + UMAP(3D)"),
+    RunSpec("metapath_1", m_metapath.run_metapath_1, "Same-layer-continuity-biased random walks + Word2Vec + UMAP(3D)"),
     RunSpec("ensemble_1", m_ensemble.run_ensemble_1, "Procrustes-aligned blend of fa23d_1 + mds_1 + spectral_1"),
     RunSpec("domaintouch_1", m_centrality.run_domaintouch_1, "fa2_1 xy + z from # distinct layers touched by neighborhood"),
-    RunSpec("raritytouch_1", m_centrality.run_raritytouch_1, "fa2_1 xy + z from rarest incident edge_type_c"),
+    RunSpec("raritytouch_1", m_centrality.run_raritytouch_1, "fa2_1 xy + z from rarest incident edge type", requires=("edge_type",)),
     RunSpec("n2vbal_densmap_1", m_n2v.run_n2vbal_densmap_1, "node2vec (p=1,q=1) + DensMAP(3D)"),
-    RunSpec("fa2rarity_1", m_fa2.run_fa2rarity_1, "ForceAtlas2 with per-edge_type_c rarity weighting"),
-    RunSpec("shell_rarity_1", m_shell.run_shell_rarity_1, "Concentric shells banded by rarest incident edge_type_c"),
+    RunSpec("fa2rarity_1", m_fa2.run_fa2rarity_1, "ForceAtlas2 with per-edge-type rarity weighting", requires=("edge_type",)),
+    RunSpec("shell_rarity_1", m_shell.run_shell_rarity_1, "Concentric shells banded by rarest incident edge type", requires=("edge_type",)),
     RunSpec("n2vbal_tsne_1", m_n2v.run_n2vbal_tsne_1, "node2vec (p=1,q=1) + openTSNE(3D)"),
-    # Need a pathways_a annotation column; skipped (not failed) when the input has none.
+    # Need a pathway annotation column (--pathway-column); skipped (not failed) when the input has none.
     RunSpec(
         "fa2pathway_1", m_pathway.run_fa2pathway_1,
         "ForceAtlas2 with real edges boosted by shared-pathway Jaccard similarity",
-        requires_columns=("pathways_a",),
+        requires=("pathways",),
     ),
     RunSpec(
         "pathway_landscape_1", m_pathway.run_pathway_landscape_1,
-        "Pure pathways_a functional landscape (TF-IDF+SVD+UMAP, neighbor-propagated)",
-        requires_columns=("pathways_a",),
+        "Pure pathway-annotation functional landscape (TF-IDF+SVD+UMAP, neighbor-propagated)",
+        requires=("pathways",),
     ),
 ]
 
@@ -162,6 +168,12 @@ def validate_registry() -> None:
         if spec.base_name in seen:
             raise ValueError(f"duplicate base_name in REGISTRY: {spec.base_name!r}")
         seen.add(spec.base_name)
+        for role in spec.requires:
+            if role not in c.ColumnSpec.OPTIONAL_ROLES:
+                raise ValueError(
+                    f"{spec.base_name}: requires={spec.requires!r} names {role!r}, which is not an "
+                    f"optional column role {c.ColumnSpec.OPTIONAL_ROLES}"
+                )
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -179,17 +191,11 @@ def build_parser() -> argparse.ArgumentParser:
             f"of {c.EDGES_FILENAME}, and {c.LOG_FILENAME}; created if missing"
         ),
     )
-    parser.add_argument(
-        "--layer-order", type=str, default=",".join(c.LAYER_ORDER),
-        help=(
-            f"comma-separated values of the {c.LAYER_COLUMN} column, bottom/innermost first; "
-            f"must list exactly the values present (default: %(default)s)"
-        ),
-    )
     parser.add_argument("--only", type=str, default=None, help="comma-separated base_names to run")
     parser.add_argument("--list", action="store_true", help="print the registry and exit")
     parser.add_argument("--dry-run", action="store_true", help="build graph, validate, no writes")
     parser.add_argument("--no-progress", action="store_true", help="disable progress bars")
+    c.add_column_arguments(parser)
     return parser
 
 
@@ -201,7 +207,7 @@ def main() -> int:
 
     if args.list:
         for spec in REGISTRY:
-            req = f"  [requires {', '.join(spec.requires_columns)}]" if spec.requires_columns else ""
+            req = f"  [requires {', '.join(spec.requires)} column]" if spec.requires else ""
             print(f"{spec.base_name:20s} {spec.description}{req}")
         return 0
 
@@ -215,8 +221,10 @@ def main() -> int:
         if not path.is_file():
             parser.error(f"input file not found: {path}")
     layer_order = c.parse_layer_order(args.layer_order)
-    if not layer_order:
-        parser.error("--layer-order must name at least one layer")
+    try:
+        columns = c.columns_from_args(args)
+    except ValueError as exc:
+        parser.error(str(exc))
 
     selected = REGISTRY
     if args.only:
@@ -231,11 +239,12 @@ def main() -> int:
 
     print(f"Loading graph from {args.input_dir} ...")
     try:
-        data = c.load_graph(nodes_in, edges_in, layer_order=layer_order)
+        data = c.load_graph(nodes_in, edges_in, columns=columns, layer_order=layer_order)
     except ValueError as exc:
         print(f"Cannot load input: {exc}", file=sys.stderr)
         return 2
     G, node_layer = data.G, data.node_layer
+    layer_order = c.layer_order(G)  # the effective order (given, or inferred from the data)
     comps = c.sorted_components(G)
     n_isolated = len(c.isolated_nodes(G))
     layer_counts = Counter(node_layer.values())
@@ -245,12 +254,17 @@ def main() -> int:
         f"components={len(comps)} giant={len(comps[0])} isolated={n_isolated}"
     )
     print(graph_desc)
-    print(f"layers ({c.LAYER_COLUMN}, bottom->top): {layers_desc}")
+    print(f"columns: {columns.describe()}")
+    print(
+        f"layers ({columns.layer}, bottom->top"
+        f"{'' if args.layer_order else ', inferred: ' + c.INFERRED_LAYER_ORDER_RULE + ', pass --layer-order to change'}): "
+        f"{layers_desc}"
+    )
 
     skipped: list[tuple[str, str]] = []
     runnable: list[RunSpec] = []
     for spec in selected:
-        missing = spec.missing_requirements(data.header, data.node_rows)
+        missing = spec.missing_requirements(data)
         if missing:
             skipped.append((spec.base_name, "; ".join(missing)))
         else:
@@ -267,7 +281,7 @@ def main() -> int:
         return 0
 
     try:
-        out = c.prepare_output_dir(args.input_dir, args.output_dir)
+        out = c.prepare_output_dir(args.input_dir, args.output_dir, id_column=columns.id)
     except ValueError as exc:
         print(f"Cannot prepare output dir: {exc}", file=sys.stderr)
         return 2
@@ -280,7 +294,9 @@ def main() -> int:
             f"input: {args.input_dir.resolve()}",
             f"output: {args.output_dir.resolve()}",
             f"graph: {graph_desc}",
-            f"layers: {c.LAYER_COLUMN} order={','.join(layer_order)} ({layers_desc})",
+            f"columns: {columns.describe()}",
+            f"layers: {columns.layer} order={','.join(layer_order)} ({layers_desc})"
+            + ("" if args.layer_order else f" [inferred: {c.INFERRED_LAYER_ORDER_RULE}]"),
             f"selected: {len(runnable)} layout(s): {', '.join(s.base_name for s in runnable)}",
         ]
         + [f"skipped: {name}: {reason}" for name, reason in skipped]
@@ -323,7 +339,9 @@ def main() -> int:
                 with c.elapsed_spinner(spec.base_name):
                     coords, meta = spec.func(G, node_layer, out.nodes)
             coords_tuples = {n: tuple(float(v) for v in p) for n, p in coords.items()}
-            recomputed = c.write_layout_columns(out.nodes, spec.base_name, coords_tuples)
+            recomputed = c.write_layout_columns(
+                out.nodes, spec.base_name, coords_tuples, id_column=columns.id
+            )
             c.append_log_entry(
                 out.log,
                 base_name=spec.base_name,

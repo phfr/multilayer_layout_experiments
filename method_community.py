@@ -47,7 +47,7 @@ def run_community_1(G, node_layer, nodes_path):
             coords[members[0]] = slot
             n_singletons += 1
             continue
-        sub = G.subgraph(members)
+        sub = c.ordered_subgraph(G, members)
         local = c.local_component_sublayout(sub)
         scale = c.LOCAL_CLUSTER_RADIUS * meta_spread * math.sqrt(len(members)) / math.sqrt(10)
         for node, p in local.items():

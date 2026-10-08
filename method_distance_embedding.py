@@ -30,8 +30,8 @@ def _hop_distance_matrix(sub: nx.Graph, nodes: list[str], *, weight_attr: str | 
 
 def _mds(G, node_layer, *, weighted: bool):
     giant = c.giant_component_nodes(G)
-    giant_nodes = sorted(giant, key=lambda n: int(n))
-    sub = G.subgraph(giant_nodes).copy()
+    giant_nodes = sorted(giant, key=c.node_key)
+    sub = c.ordered_subgraph(G, giant_nodes)
 
     weight_attr = None
     weighting_desc = "unweighted hop count"
@@ -84,8 +84,8 @@ def run_mds_2(G, node_layer, nodes_path):
 
 def _spectral(G, node_layer, *, weighted: bool):
     giant = c.giant_component_nodes(G)
-    giant_nodes = sorted(giant, key=lambda n: int(n))
-    sub = G.subgraph(giant_nodes)
+    giant_nodes = sorted(giant, key=c.node_key)
+    sub = c.ordered_subgraph(G, giant_nodes)
 
     giant_pos = c.spectral_positions(sub, 3, weighted=weighted, node_layer=node_layer)
 
@@ -134,8 +134,8 @@ def run_isomap_1(G, node_layer, nodes_path):
     embedding, which can reveal different manifold structure.
     """
     giant = c.giant_component_nodes(G)
-    giant_nodes = sorted(giant, key=lambda n: int(n))
-    sub = G.subgraph(giant_nodes)
+    giant_nodes = sorted(giant, key=c.node_key)
+    sub = c.ordered_subgraph(G, giant_nodes)
     matrix = _hop_distance_matrix(sub, giant_nodes, weight_attr=None)
 
     n_neighbors = 10

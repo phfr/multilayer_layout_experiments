@@ -47,8 +47,8 @@ def _embed_layer_3d(H: nx.Graph, *, p: float, q: float):
         return {}, 0, "empty layer"
     giant = c.giant_component_nodes(H)
     if len(giant) < MIN_NODES_FOR_UMAP:
-        giant_nodes = sorted(giant, key=lambda n: int(n))
-        raw = nx.spring_layout(H.subgraph(giant_nodes), dim=3, seed=c.GLOBAL_SEED)
+        giant_nodes = sorted(giant, key=c.node_key)
+        raw = nx.spring_layout(c.ordered_subgraph(H, giant_nodes), dim=3, seed=c.GLOBAL_SEED)
         giant_pos = {n: np.asarray(raw[n], dtype=float) for n in giant_nodes}
         note = f"giant component of {len(giant)} nodes < {MIN_NODES_FOR_UMAP}: spring_layout(dim=3) instead of node2vec+UMAP"
     else:
@@ -97,8 +97,8 @@ def run_n2vlayered_1(G, node_layer, nodes_path):
     top_nodes = [n for n, l in node_layer.items() if l == top]
     middle_nodes = [n for n, l in node_layer.items() if l in middle_layers]
 
-    bottom_pos_raw, bottom_fallback_n, bottom_note = _embed_layer_3d(G.subgraph(bottom_nodes), p=1, q=1)
-    top_pos_raw, top_fallback_n, top_note = _embed_layer_3d(G.subgraph(top_nodes), p=1, q=1)
+    bottom_pos_raw, bottom_fallback_n, bottom_note = _embed_layer_3d(c.ordered_subgraph(G, bottom_nodes), p=1, q=1)
+    top_pos_raw, top_fallback_n, top_note = _embed_layer_3d(c.ordered_subgraph(G, top_nodes), p=1, q=1)
 
     bottom_arr = np.array(list(bottom_pos_raw.values()))
     top_arr = np.array(list(top_pos_raw.values()))
@@ -132,7 +132,7 @@ def run_n2vlayered_1(G, node_layer, nodes_path):
 
     for _ in range(MIDDLE_RELAX_ITERS):
         max_delta = 0.0
-        for m in sorted(reachable_nodes, key=lambda n: int(n)):
+        for m in sorted(reachable_nodes, key=c.node_key):
             neighbor_positions = [
                 anchors[nb] if nb in anchors else middle_pos[nb]
                 for nb in G.neighbors(m)

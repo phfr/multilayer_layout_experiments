@@ -16,18 +16,19 @@ import common as c
 
 
 def _rarity_weights(G: nx.Graph) -> dict[str, float]:
-    """weight = -ln(edge_type_c count / total edges): one weight per distinct
-    edge_type_c value (data-driven), not the binary within/cross-layer split
-    fa2_3 uses -- edges of a rare type get pulled tighter than edges of a
-    common type instead of both being lumped into one 'cross-layer' bucket."""
-    counts = Counter(data.get("edge_type_c", "") for _, _, data in G.edges(data=True))
+    """weight = -ln(edge type count / total edges): one weight per distinct
+    value of the edge-type column (data-driven), not the binary within/cross-
+    layer split fa2_3 uses -- edges of a rare type get pulled tighter than
+    edges of a common type instead of both being lumped into one
+    'cross-layer' bucket."""
+    counts = Counter(data.get("edge_type", "") for _, _, data in G.edges(data=True))
     total = sum(counts.values()) or 1
     return {et: -math.log(cnt / total) for et, cnt in counts.items()}
 
 
 def run_fa2_1(G, node_layer, nodes_path):
     iso = c.isolated_nodes(G)
-    Gc = G.subgraph([n for n in G.nodes() if n not in iso])
+    Gc = c.ordered_subgraph(G, [n for n in G.nodes() if n not in iso])
     xy = nx.forceatlas2_layout(Gc, max_iter=100, seed=c.GLOBAL_SEED, dim=2)
     coords, z_by_layer = c.layer_z_stack(xy, node_layer, order=c.layer_order(G))
     coords.update(c.place_isolated_ring_per_layer(xy, node_layer, iso, z_by_layer))
@@ -43,7 +44,7 @@ def run_fa2_1(G, node_layer, nodes_path):
 
 def run_fa2_2(G, node_layer, nodes_path):
     iso = c.isolated_nodes(G)
-    Gc = G.subgraph([n for n in G.nodes() if n not in iso])
+    Gc = c.ordered_subgraph(G, [n for n in G.nodes() if n not in iso])
     xy = nx.forceatlas2_layout(
         Gc, max_iter=100, seed=c.GLOBAL_SEED, dim=2, linlog=True, dissuade_hubs=True
     )
@@ -70,7 +71,7 @@ def run_fa2_2(G, node_layer, nodes_path):
 
 def run_fa2_3(G, node_layer, nodes_path):
     iso = c.isolated_nodes(G)
-    Gc = G.subgraph([n for n in G.nodes() if n not in iso]).copy()
+    Gc = c.ordered_subgraph(G, [n for n in G.nodes() if n not in iso])
     c.set_attraction_weight(Gc, node_layer)
     xy = nx.forceatlas2_layout(Gc, max_iter=100, seed=c.GLOBAL_SEED, dim=2, weight="fa_weight")
     coords, z_by_layer = c.layer_z_stack(xy, node_layer, order=c.layer_order(G))
@@ -91,10 +92,10 @@ def run_fa2sep_1(G, node_layer, nodes_path):
     iso_all: list[str] = []
     for layer in layers:
         layer_nodes = [n for n, l in node_layer.items() if l == layer]
-        sub = G.subgraph(layer_nodes)
+        sub = c.ordered_subgraph(G, layer_nodes)
         iso = c.isolated_nodes(sub)
         iso_all.extend(iso)
-        sub_conn = sub.subgraph([n for n in layer_nodes if n not in iso])
+        sub_conn = c.ordered_subgraph(sub, [n for n in layer_nodes if n not in iso])
         if sub_conn.number_of_nodes():
             xy.update(nx.forceatlas2_layout(sub_conn, max_iter=100, seed=c.GLOBAL_SEED, dim=2))
 
@@ -123,7 +124,7 @@ def run_fa2spectral_1(G, node_layer, nodes_path):
     convergence). Shared xy, discrete z per layer like fa2_1.
     """
     iso = c.isolated_nodes(G)
-    Gc = G.subgraph([n for n in G.nodes() if n not in iso])
+    Gc = c.ordered_subgraph(G, [n for n in G.nodes() if n not in iso])
     # Rescale + jitter the seed: raw spectral coordinates put structurally
     # equivalent nodes at identical points, which makes FA2's repulsion
     # explode (see common.SEED_JITTER_FRACTION).
@@ -153,7 +154,7 @@ def run_fa2spectral_1(G, node_layer, nodes_path):
 
 def run_fa23d_1(G, node_layer, nodes_path):
     iso = c.isolated_nodes(G)
-    Gc = G.subgraph([n for n in G.nodes() if n not in iso])
+    Gc = c.ordered_subgraph(G, [n for n in G.nodes() if n not in iso])
     pos = nx.forceatlas2_layout(Gc, max_iter=100, seed=c.GLOBAL_SEED, dim=3)
     coords = {n: p for n, p in pos.items()}
     coords.update(c.place_isolated_sphere_shell(pos, iso))
@@ -169,7 +170,7 @@ def run_fa23d_1(G, node_layer, nodes_path):
 
 def run_fa23d_2(G, node_layer, nodes_path):
     iso = c.isolated_nodes(G)
-    Gc = G.subgraph([n for n in G.nodes() if n not in iso]).copy()
+    Gc = c.ordered_subgraph(G, [n for n in G.nodes() if n not in iso])
     c.set_attraction_weight(Gc, node_layer)
     pos = nx.forceatlas2_layout(Gc, max_iter=100, seed=c.GLOBAL_SEED, dim=3, weight="fa_weight")
     coords = {n: p for n, p in pos.items()}
@@ -186,16 +187,17 @@ def run_fa23d_2(G, node_layer, nodes_path):
 
 def run_fa2rarity_1(G, node_layer, nodes_path):
     iso = c.isolated_nodes(G)
-    Gc = G.subgraph([n for n in G.nodes() if n not in iso]).copy()
+    Gc = c.ordered_subgraph(G, [n for n in G.nodes() if n not in iso])
+    et_col = c.columns(G).edge_type
     weights = _rarity_weights(Gc)
     for _, _, data in Gc.edges(data=True):
-        data["rarity_weight"] = weights.get(data.get("edge_type_c", ""), 1.0)
+        data["rarity_weight"] = weights.get(data.get("edge_type", ""), 1.0)
     xy = nx.forceatlas2_layout(Gc, max_iter=100, seed=c.GLOBAL_SEED, dim=2, weight="rarity_weight")
     coords, z_by_layer = c.layer_z_stack(xy, node_layer, order=c.layer_order(G))
     coords.update(c.place_isolated_ring_per_layer(xy, node_layer, iso, z_by_layer))
     meta = dict(
         method=(
-            "ForceAtlas2 with per-edge_type_c rarity weighting "
+            f"ForceAtlas2 with per-{et_col} rarity weighting "
             "(-ln(count/total), not the binary within/cross-layer split), z-stacked"
         ),
         library_call="nx.forceatlas2_layout(G, max_iter=100, seed=42, dim=2, weight='rarity_weight')",
@@ -205,7 +207,7 @@ def run_fa2rarity_1(G, node_layer, nodes_path):
             "dim": 2,
             "rarity_weights": {k: round(v, 3) for k, v in weights.items()},
         },
-        weighting_desc="attraction weight = -ln(edge_type_c count / total edges), one bucket per distinct type",
+        weighting_desc=f"attraction weight = -ln({et_col} count / total edges), one bucket per distinct type",
         fallback_notes=f"{len(iso)} isolated nodes ring-placed per layer at z={z_by_layer}",
     )
     return coords, meta

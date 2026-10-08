@@ -1,12 +1,15 @@
 """Metapath-biased random walks: like node2vec, but the walk's transition
-probability is biased by edge_type_c (domain continuity) rather than being
-purely topology-driven -- node2vec's p/q only control BFS/DFS exploration
-bias, never look at edge TYPE at all. Walks here are SAME_DOMAIN_BOOST times
-more likely to continue along a same-domain edge (an edge_type_c whose
-two halves match, e.g. protein-protein, transcript-transcript,
-metabolite-metabolite) than to cross domains, so the resulting embedding reflects domain-continuity structure
-that plain node2vec can't see. The node2vec package doesn't expose
-per-edge-type biasing, so this uses a small custom weighted-walk generator
+probability is biased toward domain continuity rather than being purely
+topology-driven -- node2vec's p/q only control BFS/DFS exploration bias,
+never look at node/edge TYPE at all. Walks here are SAME_DOMAIN_BOOST times
+more likely to continue along a same-layer edge (both endpoints in the same
+layer, e.g. protein-protein or metabolite-metabolite) than to cross into
+another layer, so the resulting embedding reflects domain-continuity
+structure that plain node2vec can't see. "Same domain" is defined from the
+endpoints' layer attribute, not from parsing an edge-type string, so it
+needs no edge-type column and no naming convention (on the wwiznet data the
+two definitions coincide exactly). The node2vec package doesn't expose
+per-edge biasing, so this uses a small custom weighted-walk generator
 feeding directly into gensim's Word2Vec (the same training call node2vec
 uses internally).
 """
@@ -27,11 +30,9 @@ WALK_LENGTH = 20
 NUM_WALKS = 100
 
 
-def _is_same_domain(edge_type_c: str) -> bool:
-    if "-" not in edge_type_c:
-        return False
-    a, b = edge_type_c.split("-", 1)
-    return a == b
+def _is_same_domain(G: nx.Graph, u: str, v: str) -> bool:
+    """Both endpoints in the same layer (layer attr set by common.build_graph)."""
+    return G.nodes[u].get("layer") == G.nodes[v].get("layer")
 
 
 def _generate_walk(G: nx.Graph, start: str, rng: random.Random) -> list[str]:
@@ -41,10 +42,7 @@ def _generate_walk(G: nx.Graph, start: str, rng: random.Random) -> list[str]:
         neighbors = list(G.neighbors(current))
         if not neighbors:
             break
-        weights = [
-            SAME_DOMAIN_BOOST if _is_same_domain(G.edges[current, nb].get("edge_type_c", "")) else 1.0
-            for nb in neighbors
-        ]
+        weights = [SAME_DOMAIN_BOOST if _is_same_domain(G, current, nb) else 1.0 for nb in neighbors]
         total = sum(weights)
         r = rng.random() * total
         acc = 0.0
@@ -61,8 +59,8 @@ def _generate_walk(G: nx.Graph, start: str, rng: random.Random) -> list[str]:
 
 def run_metapath_1(G, node_layer, nodes_path):
     giant = c.giant_component_nodes(G)
-    giant_nodes = sorted(giant, key=lambda n: int(n))
-    sub = G.subgraph(giant_nodes)
+    giant_nodes = sorted(giant, key=c.node_key)
+    sub = c.ordered_subgraph(G, giant_nodes)
 
     rng = random.Random(c.GLOBAL_SEED)
     walks = []
@@ -99,7 +97,7 @@ def run_metapath_1(G, node_layer, nodes_path):
     coords.update(fallback_pos)
 
     meta = dict(
-        method="Metapath-biased random walks (edge_type_c domain-continuity bias) + Word2Vec + UMAP(3D)",
+        method="Metapath-biased random walks (same-layer domain-continuity bias) + Word2Vec + UMAP(3D)",
         library_call="custom weighted walk generator -> gensim.models.Word2Vec(sg=1) -> umap.UMAP(3D)",
         params={
             "same_domain_boost": SAME_DOMAIN_BOOST,
@@ -108,7 +106,7 @@ def run_metapath_1(G, node_layer, nodes_path):
             "dimensions": c.N2V_DIMENSIONS,
             "seed": c.GLOBAL_SEED,
         },
-        weighting_desc=f"walk transitions weighted {SAME_DOMAIN_BOOST}x toward same-domain edge types",
+        weighting_desc=f"walk transitions weighted {SAME_DOMAIN_BOOST}x toward same-layer (same-domain) edges",
         fallback_notes=(
             f"{len(remaining)} nodes outside the giant component (walks can't leave a "
             f"disconnected component) placed via Fibonacci-sphere shell, "

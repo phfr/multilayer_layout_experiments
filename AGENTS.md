@@ -14,7 +14,10 @@ viewer app; it only produces data the frontend already knows how to consume
 (see "Frontend contract" below). Entry point: `run_layouts.py`:
 
 ```bash
-python3 run_layouts.py -i INPUT_DIR -o OUTPUT_DIR [--only a,b] [--layer-order t,p,m]
+python3 run_layouts.py -i INPUT_DIR -o OUTPUT_DIR [--only a,b] [--layer-order t,p,m] \
+    [--id-column id] [--layer-column layer_c] [--type-column type_a|none] \
+    [--pathway-column pathways_a|none] [--source-column source] [--target-column target] \
+    [--edge-type-column edge_type_c|none]
 ```
 
 Output folder contents (see `common.prepare_output_dir`):
@@ -27,21 +30,48 @@ Output folder contents (see `common.prepare_output_dir`):
 - `edges.tsv` — verbatim copy, so the folder is a complete dataset.
 - `layout_run_log.txt` — append-only; every run opens with a banner whose
   first line is the exact command (`shlex.join(sys.argv)`), then interpreter,
-  cwd, input/output paths, graph stats, layer order, and the selected/skipped
-  layouts (`common.append_run_header`), followed by one entry per layout.
+  cwd, input/output paths, graph stats, the column-role mapping, layer order
+  (flagged `[inferred: ...]` when `--layer-order` was not given), and the
+  selected/skipped layouts (`common.append_run_header`), followed by one
+  entry per layout.
 
 Pointing `-o` at the input folder is allowed and degrades to in-place mode.
 
-## Data model — verify before trusting these numbers
+## Data model — column roles, not column names
 
-Re-derive with `python3 run_layouts.py -i DIR --dry-run` (prints node/edge/
-component counts, per-layer counts and which layouts would be skipped)
-rather than hardcoding assumptions — the data has been swapped wholesale
-once already (a 900-node protein/bridge/metabolite network with 10 edge
-types and pathway/GO annotation columns → the current one), and layouts
-that hardcoded the old layer names or edge-type counts all had to change.
-Treat layer names, edge-type vocabularies and annotation columns as
-**data-driven**, never as constants in a method file.
+Nothing in a method file reads `nodes.tsv` / `edges.tsv` through a literal
+column name. `common.ColumnSpec` maps seven **roles** to input columns, the
+CLI fills it from the `--*-column` flags (`common.add_column_arguments` /
+`columns_from_args`, shared with `evaluate_umap_params.py`), and
+`build_graph` turns the roles into fixed graph attributes that method code
+reads:
+
+| Role | `ColumnSpec` field / flag | Default column | Where it ends up |
+|---|---|---|---|
+| node id | `id` / `--id-column` | `id` | the node key in `G` |
+| layer | `layer` / `--layer-column` | `layer_c` | node attr `layer`; `node_layer` dict; `c.layer_order(G)` |
+| type (optional) | `type` / `--type-column` | `type_a` | node attr `type` (`""` if none) |
+| pathways (optional) | `pathways` / `--pathway-column` | `pathways_a` | node attr `pathways` (frozenset, parsed from a comma-separated `_a` column) |
+| source / target | `source`, `target` / `--source-column`, `--target-column` | `source`, `target` | edge endpoints |
+| edge type (optional) | `edge_type` / `--edge-type-column` | `edge_type_c` | edge attr `edge_type` (`""` if none) |
+
+The spec is stored on the graph (`c.columns(G)`) so a layout can name the
+real column in its log text (e.g. `hive5_1`: "one spoke per raw type_a
+value"), but **layout logic must read the attributes**, never the column.
+Optional roles can be `None` (`--type-column none`); a configured-but-absent
+optional column is tolerated (attribute empty) and only matters through
+`RunSpec.requires` (below). Required roles (id, layer, source, target)
+missing from the header are a load error naming the flag to pass.
+
+Re-derive the numbers below with `python3 run_layouts.py -i DIR --dry-run`
+(prints node/edge/component counts, the column mapping, per-layer counts
+and which layouts would be skipped) rather than hardcoding assumptions —
+the data has been swapped wholesale once already (a 900-node
+protein/bridge/metabolite network with 10 edge types and pathway/GO
+annotation columns → the current one), and layouts that hardcoded the old
+layer names or edge-type counts all had to change. Treat layer names,
+edge-type vocabularies and annotation columns as **data-driven**, never as
+constants in a method file.
 
 As of this writing (`wwiznet_ppimetabolite/prepare/raw_input`): **263
 nodes, 317 edges, 1 connected component, 0 isolated nodes**.
@@ -49,35 +79,48 @@ nodes, 317 edges, 1 connected component, 0 isolated nodes**.
 `nodes.tsv` columns (8): `id, name, degree_n, layer_c, type_a,
 protein_id_c, transcript_id_c, metabolite_id_c`.
 
-- **`layer_c` is the layer column** (`common.LAYER_COLUMN`). Values:
+- **`layer_c` is the layer column** (default `ColumnSpec.layer`). Values:
   `transcript` (141), `protein` (90), `metabolite` (32). The stacking order
-  — bottom/innermost first — is `common.LAYER_ORDER` =
-  `("transcript", "protein", "metabolite")`, overridable per run with
-  `--layer-order`. `build_graph` refuses a layer value not in the order and
-  an order entry with no nodes, so the two always agree. The effective order
-  is stored on the graph as `G.graph["layer_order"]`; **method code must read
-  it via `c.layer_order(G)`**, never spell layer names out.
+  — bottom/innermost first — comes from `--layer-order`; when not given it
+  is **inferred as descending node count** (ties by first appearance,
+  `common.infer_layer_order` / `INFERRED_LAYER_ORDER_RULE`), which on this
+  data is `transcript, protein, metabolite` — the same order the old
+  hardcoded default had, so existing outputs are reproduced without flags.
+  There is no hardcoded layer list anywhere any more. `build_graph` refuses
+  an explicit order that misses a value present in the data or names one
+  with no nodes, so the two always agree. The effective order is stored on
+  the graph as `G.graph["layer_order"]`; **method code must read it via
+  `c.layer_order(G)`**, never spell layer names out.
 - `type_a` is a finer per-node type (currently one value per node, e.g.
   `protein_bridge`, `transcript_differentially_expressed`; 5 values). Loaded
-  as node attr `type_a` (`""` if the column is absent). Used only by
-  `hive5_1` (one spoke per value) and `landscape_1` (one-hot feature block).
+  as node attr `type` (`""` if there is no type column). Used only by
+  `hive5_1` (one spoke per value; `requires=("type",)`) and `landscape_1`
+  (one-hot feature block, simply absent without the column).
 - `pathways_a` (optional, absent in the current data) is the only annotation
   column any layout consumes. `fa2pathway_1` / `pathway_landscape_1` declare
-  `requires_columns=("pathways_a",)` on their `RunSpec` and are **skipped
-  with a `SKIPPED` log entry** (not failed) when it is absent or empty.
+  `requires=("pathways",)` on their `RunSpec` and are **skipped with a
+  `SKIPPED` log entry** (not failed) when the role has no usable column.
   `_a`-suffixed columns are comma-separated arrays (frontend convention).
 - `degree_n` is a precomputed column but **nothing in this codebase reads
   it** — every layout uses `G.degree(n)` from the live graph built by
   `common.build_graph()`. If `nodes.tsv`'s `degree_n` and the live graph
   ever disagree, the live graph wins everywhere.
-- Node ids are integers-as-strings; helpers sort by `int(id)`.
+- Node ids are arbitrary strings. Every stable ordering goes through
+  `c.node_key` (numeric-looking ids sort numerically, others
+  lexicographically after them) — **never `int(id)`**, which is what used to
+  tie the code to integer ids.
 
 `edges.tsv` columns: `source, target, edge_type_c`. `edge_type_c` (5 distinct
 values: `protein-protein`, `transcript-transcript`, `metabolite-metabolite`,
-`protein-metabolite`, `transcript-metabolite`) is loaded onto the graph.
-Note there are **no transcript-protein edges**: both non-metabolite layers
-connect to each other only through metabolites, which matters for any
-layout that fixes the outer layers and relaxes the middle one
+`protein-metabolite`, `transcript-metabolite`) is loaded as edge attr
+`edge_type`. The layouts that need it (`fa2rarity_1`, `raritytouch_1`,
+`shell_rarity_1`) declare `requires=("edge_type",)` and are skipped without
+it; `landscape_1` just drops its edge-type feature block; `metapath_1`
+defines "same domain" from the endpoints' `layer` attributes (identical to
+the `a-b` string convention on this data) and so needs no edge types at
+all. Note there are **no transcript-protein edges**: both non-metabolite
+layers connect to each other only through metabolites, which matters for
+any layout that fixes the outer layers and relaxes the middle one
 (`n2vlayered_1`). An edge whose endpoint is not a node id is an error.
 
 Both files are **tab-separated, no BOM**. The current input is
@@ -134,14 +177,16 @@ def run_<base_name>(G: nx.Graph, node_layer: dict[str, str], nodes_path: Path
 
 - `G` — the full graph from `common.build_graph()`: every node from
   `nodes.tsv` present (including degree-0 ones), node attrs `layer`,
-  `type_a`, `pathways` (frozenset); edge attr `edge_type_c`; graph attrs
-  `layer_order` / `layer_column` (read via `c.layer_order(G)`).
+  `type`, `pathways` (frozenset); edge attr `edge_type`; graph attrs
+  `layer_order` / `layer_column` / `columns` (read via `c.layer_order(G)` /
+  `c.columns(G)`).
 - `node_layer` — `{node_id: layer}`, same as `nx.get_node_attributes(G,
   'layer')`, passed separately for convenience/history.
 - `nodes_path` — the **output** `nodes.tsv` (already seeded from the input
   before the first layout runs). Only used by layouts that read back
   already-computed columns (e.g. `method_centrality.py`'s
-  `_get_or_compute_fa2_xy`, which reuses `fa2_1`'s xy if present).
+  `_get_or_compute_fa2_xy`, which reuses `fa2_1`'s xy if present — keyed by
+  `c.columns(G).id`, not a literal `"id"`).
 - Returns `coords` (must have an entry for **every** node in `G`, values
   are anything unpackable as 3 floats — tuple, list, or `np.ndarray` all
   work since `write_layout_columns` does `x, y, z = coords[id]`) and `meta`
@@ -165,7 +210,7 @@ without a reason**:
 **Pattern A ("fa2 family")** — used when the base algorithm tolerates
 disconnected input natively (ForceAtlas2, spring layout do):
 1. `iso = c.isolated_nodes(G)`; exclude only those, keep small components
-   in the simulation: `Gc = G.subgraph([n for n in G.nodes() if n not in iso])`.
+   in the simulation: `Gc = c.ordered_subgraph(G, [n for n in G.nodes() if n not in iso])`.
 2. Run the algorithm on `Gc`.
 3. Place isolated nodes afterward: `c.place_isolated_ring_per_layer(...)`
    (for z-stacked 2D+z layouts) or `c.place_isolated_sphere_shell(...)`
@@ -176,7 +221,7 @@ global distance/embedding structure that's meaningless across components
 (Kamada-Kawai, MDS, spectral embedding, node2vec-based methods, since walks
 can't cross components):
 1. `giant = c.giant_component_nodes(G)`; run the algorithm on
-   `G.subgraph(giant)` only.
+   `c.ordered_subgraph(G, giant)` only.
 2. `remaining = [n for n in G.nodes() if n not in giant]`.
 3. `c.deterministic_fallback_shell(giant_pos, remaining, G)` places every
    remaining node (both isolated singles AND small components) on a
@@ -203,15 +248,20 @@ whose giant component has fewer than `MIN_NODES_FOR_UMAP` nodes).
 
 | Helper | Use for |
 |---|---|
-| `build_graph(...)` / `load_graph(..., layer_order=)` / `parse_layer_order(s)` | Graph construction (call once via `load_graph`, not per-layout); validates `layer_c` against the order |
+| `ColumnSpec` / `DEFAULT_COLUMNS` / `add_column_arguments(parser)` / `columns_from_args(args)` | The column-role model and its CLI flags (shared by `run_layouts.py` and `evaluate_umap_params.py`) |
+| `build_graph(..., columns=, layer_order=)` / `load_graph(...)` / `parse_layer_order(s)` / `infer_layer_order(rows, col)` | Graph construction (call once via `load_graph`, not per-layout); maps roles to attrs, validates the layer column against an explicit order or infers one |
 | `layer_order(G)` | The run's layer stacking order, first = bottom/innermost — **the only sanctioned way for a method to learn layer names** |
+| `columns(G)` | The run's `ColumnSpec` — for naming the real input column in log text only, never for layout logic |
+| `missing_role_columns(...)` / `GraphData.missing_role_columns(roles)` | Why an optional role (`type` / `pathways` / `edge_type`) is unusable on this input; drives `RunSpec.requires` skipping |
+| `node_key(n)` | Sort key for node ids (numeric-aware, string-safe) — use for every deterministic node ordering instead of `int(id)` |
 | `layer_axis_offsets(order, step)` | Signed, zero-centred offsets along one axis per layer (3 layers → `-step, 0, +step`) |
-| `prepare_output_dir(input_dir, output_dir)` | Seeds/rebuilds the output `nodes.tsv`, copies `edges.tsv`, returns the output paths (`OutputPaths`) |
+| `prepare_output_dir(input_dir, output_dir, id_column=)` | Seeds/rebuilds the output `nodes.tsv` (rows matched by the id column), copies `edges.tsv`, returns the output paths (`OutputPaths`) |
 | `append_run_header(log, argv=, details=)` | The per-run log banner (exact command line first) |
 | `detect_line_terminator(path)` | `"\r\n"` or `"\n"`, so rewrites keep the input's convention |
 | `set_attraction_weight(G, node_layer, ...)` | FA2/spring edge weight: **higher = closer**. Writes to `G` edge attr `fa_weight` by default |
 | `set_distance_weight(G, node_layer, ...)` | KK/MDS-hop edge weight: **higher = farther**. Opposite semantics from above — don't mix them up |
 | `sorted_components(H)` / `giant_component_nodes(H)` / `isolated_nodes(H)` | Connectivity queries, deterministic ordering (size desc, then min id) |
+| `ordered_subgraph(G, nodes)` | Induced subgraph as a real graph in G's node/adjacency order — **the only way to build a subgraph that a layout algorithm consumes** (see gotchas) |
 | `fibonacci_sphere(n)` | Deterministic, RNG-free unit directions on a sphere — reuse this instead of `np.random` for any "spread N things evenly in 3D" need |
 | `ring_positions_2d(n, radius)` | Same idea but a 2D circle (for z-stacked layouts) |
 | `local_component_sublayout(H)` | Small-component (2-10 node) internal layout, centered at origin, not yet placed |
@@ -220,7 +270,7 @@ whose giant component has fewer than `MIN_NODES_FOR_UMAP` nodes).
 | `spectral_positions(H, n_components, ...)` | Shared spectral embedding used by both `spectral_1/2` and `fa2spectral_1`'s warm-start seed |
 | `layer_z_stack(xy, node_layer, order=c.layer_order(G))` | Turns a 2D layout into z-stacked 3D: one plane per layer in `order`, `Z_STACK_FRACTION` × that run's own xy spread apart, centred on z=0 — returns `z_by_layer` too, for `place_isolated_ring_per_layer` |
 | `elapsed_spinner(desc)` | Context manager: nested tqdm bar showing elapsed time for a layout with no native progress hooks — used by default for every layout now (see "Progress bar" below) |
-| `read_nodes_tsv` / `read_edges_tsv` / `write_layout_columns` / `append_log_entry` | TSV IO — line terminator preserved from the file, always atomic write (temp file + `os.replace`) |
+| `read_nodes_tsv` / `read_edges_tsv` / `write_layout_columns(..., id_column=)` / `append_log_entry` | TSV IO — line terminator preserved from the file, always atomic write (temp file + `os.replace`) |
 | `validate_base_name(name)` | Called automatically by `write_layout_columns` and `run_layouts.py`'s registry validation — raises if `name` ends in a reserved suffix |
 
 Constants live at the top of `common.py`, each with a comment explaining
@@ -265,11 +315,17 @@ Consequences:
    description>")` to `run_layouts.py`'s `REGISTRY` list. Cheap/deterministic
    layouts go earlier in the list (so a partial/interrupted run still
    yields something), expensive ones (node2vec-based, ~40-120s each) later.
-   If it needs an optional column, declare `requires_columns=("col",)` so
-   it is skipped (not failed) on inputs without it.
-4. Never hardcode layer names, layer counts, or edge-type vocabularies:
-   use `c.layer_order(G)` and `Counter` over `edge_type_c` so the layout
-   survives the next dataset swap.
+   If it needs an optional column role, declare `requires=("type",)` /
+   `("pathways",)` / `("edge_type",)` (roles, not column names —
+   `validate_registry` rejects anything else) so it is skipped (not failed)
+   on inputs that can't fill the role.
+4. Never hardcode column names, layer names, layer counts, or edge-type
+   vocabularies: read node attrs `layer` / `type` / `pathways` and edge attr
+   `edge_type`, use `c.layer_order(G)` for the layer list, `Counter` over
+   `edge_type` for the type vocabulary, `c.node_key` for ordering, and
+   `c.columns(G).<role>` only to name the input column in log text. Handle
+   an empty `type` / `edge_type` (`""`) gracefully unless you declared the
+   role in `requires`.
 5. Smoke-test in isolation first: `python3 run_layouts.py -i IN -o
    SCRATCH_OUT --only <base_name> --no-progress` (see "Testing" below for
    the full checklist).
@@ -303,6 +359,11 @@ bad = [(r["id"], col) for r in rows for col in header
 assert not bad                                                  # no NaN/Inf
 assert c.detect_line_terminator(f"{OUT}/nodes.tsv") == c.detect_line_terminator(f"{IN}/nodes.tsv")
 ```
+
+Also run the same `--only` smoke test once with a dataset that has
+**different column names, string ids and no optional columns** (a tiny
+synthetic one is fine) using the `--*-column` flags — that is what catches a
+stray `row["id"]`, `int(n)` or `"edge_type_c"` literal.
 
 Also worth a spot-check for genuinely new signals: confirm the column
 isn't degenerate (e.g. `domaintouch_1`'s z has at most as many distinct
@@ -361,6 +422,25 @@ conflicts (checked each time). See `README.md`'s Dependencies section for
 the full `pip install` line.
 
 ## Other gotchas learned the hard way
+
+- **Never feed a `G.subgraph(...)` view to a layout algorithm; use
+  `c.ordered_subgraph(G, nodes)`.** A networkx subgraph view iterates in
+  `set` order whenever the kept set is smaller than half the graph
+  (`nx.filters.show_nodes` stores a set), and `str` hashes are randomised
+  per process — so `nx.forceatlas2_layout(view, seed=42)` hands out its
+  seeded random initial positions to different nodes on every run.
+  `fa2sep_1`, `community_1`, `community_shellz_1` and `n2vlayered_1` were
+  silently non-reproducible for exactly this reason until every
+  algorithm-feeding subgraph went through `ordered_subgraph` (confirmed by
+  running the old code twice and diffing). `ordered_subgraph` also copies
+  each node's *neighbour* order from the parent graph instead of going
+  through `add_edges_from` / `Graph.copy()` — those reorder neighbours, and
+  the random-walk layouts (node2vec family, `metapath_1`) pick the next step
+  by position in `G.neighbors()`, so a plain copy changes their output even
+  for the full graph. Views are still fine for `sorted_components` /
+  `connected_components`, whose results are sorted anyway. The tell-tale:
+  a seeded layout whose coordinates differ between two otherwise identical
+  runs.
 
 - **Never feed a raw spectral embedding to ForceAtlas2 as a warm start.**
   Structurally equivalent nodes (same neighbour set) get numerically

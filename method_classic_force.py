@@ -20,7 +20,7 @@ import common as c
 
 def run_fr3d_1(G, node_layer, nodes_path):
     iso = c.isolated_nodes(G)
-    Gc = G.subgraph([n for n in G.nodes() if n not in iso])
+    Gc = c.ordered_subgraph(G, [n for n in G.nodes() if n not in iso])
     pos = nx.spring_layout(Gc, dim=3, seed=c.GLOBAL_SEED)
     coords = {n: p for n, p in pos.items()}
     coords.update(c.place_isolated_sphere_shell(pos, iso))
@@ -36,7 +36,7 @@ def run_fr3d_1(G, node_layer, nodes_path):
 
 def run_fr3d_2(G, node_layer, nodes_path):
     iso = c.isolated_nodes(G)
-    Gc = G.subgraph([n for n in G.nodes() if n not in iso]).copy()
+    Gc = c.ordered_subgraph(G, [n for n in G.nodes() if n not in iso])
     c.set_attraction_weight(Gc, node_layer)
     pos = nx.spring_layout(Gc, dim=3, seed=c.GLOBAL_SEED, weight="fa_weight")
     coords = {n: p for n, p in pos.items()}
@@ -53,8 +53,8 @@ def run_fr3d_2(G, node_layer, nodes_path):
 
 def _kk3d(G, node_layer, *, weighted: bool):
     giant = c.giant_component_nodes(G)
-    giant_nodes = sorted(giant, key=lambda n: int(n))
-    sub = G.subgraph(giant_nodes).copy()
+    giant_nodes = sorted(giant, key=c.node_key)
+    sub = c.ordered_subgraph(G, giant_nodes)
 
     weight_attr = None
     weighting_desc = "unweighted (hop distance)"

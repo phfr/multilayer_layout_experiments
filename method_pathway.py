@@ -1,7 +1,8 @@
-"""Layouts driven by a real pathways_a biological annotation column
-(Reactome-style pathway names), not structural proxies. The column is
-optional: run_layouts.py skips both layouts (with a SKIPPED log entry) when
-the input has no pathways_a or it is empty for every node. When present it
+"""Layouts driven by a real biological pathway annotation column
+(--pathway-column, default pathways_a: comma-separated Reactome-style
+pathway names), not structural proxies. The column is optional:
+run_layouts.py skips both layouts (with a SKIPPED log entry) when the input
+has no such column or it is empty for every node. When present it
 typically annotates only a subset of nodes (gene-centric, so metabolites
 are usually unannotated), so both layouts have an explicit strategy for
 the coverage gap rather than silently ignoring the rest of the graph.
@@ -34,13 +35,14 @@ def _jaccard(a: frozenset, b: frozenset) -> float:
 
 def run_fa2pathway_1(G, node_layer, nodes_path):
     """ForceAtlas2 with real interaction edges' attraction boosted by the
-    Jaccard similarity of their endpoints' pathways_a sets, on top of the
+    Jaccard similarity of their endpoints' pathway sets, on top of the
     unweighted baseline. Real topology stays primary -- this only reinforces
     it, never replaces it, so unannotated nodes/edges behave exactly like
     fa2_1.
     """
+    pw_col = c.columns(G).pathways
     iso = c.isolated_nodes(G)
-    Gc = G.subgraph([n for n in G.nodes() if n not in iso]).copy()
+    Gc = c.ordered_subgraph(G, [n for n in G.nodes() if n not in iso])
 
     n_boosted = 0
     for u, v, data in Gc.edges(data=True):
@@ -59,7 +61,7 @@ def run_fa2pathway_1(G, node_layer, nodes_path):
         method=(
             "ForceAtlas2 with pathway-augmented edge weights: real interaction "
             "edges get attraction boosted by Jaccard similarity of endpoints' "
-            "pathways_a annotation (real topology stays primary), z-stacked"
+            f"{pw_col} annotation (real topology stays primary), z-stacked"
         ),
         library_call="nx.forceatlas2_layout(G, max_iter=100, seed=42, dim=2, weight='pathway_weight')",
         params={"max_iter": 100, "seed": c.GLOBAL_SEED, "dim": 2, "pathway_boost": PATHWAY_BOOST},
@@ -74,7 +76,7 @@ def run_fa2pathway_1(G, node_layer, nodes_path):
 
 
 def _build_pathway_matrix(G):
-    nodes = sorted(G.nodes(), key=lambda n: int(n))
+    nodes = sorted(G.nodes(), key=c.node_key)
     node_idx = {nid: i for i, nid in enumerate(nodes)}
     vocab = sorted({t for n in nodes for t in G.nodes[n].get("pathways", frozenset())})
     term_idx = {t: i for i, t in enumerate(vocab)}
@@ -114,12 +116,13 @@ def _build_pathway_matrix(G):
 
 
 def run_pathway_landscape_1(G, node_layer, nodes_path):
-    """Pure 'functional' landscape from real pathways_a annotation (not
+    """Pure 'functional' landscape from real pathway annotation (not
     structural proxies like landscape_1/rwr_1): TF-IDF-weighted pathway
     multi-hot -> TruncatedSVD -> UMAP(3D). Similarity here means real
     biological pathway co-membership, propagated through the graph to cover
     nodes (typically all metabolites) with no direct annotation.
     """
+    pw_col = c.columns(G).pathways
     nodes, X, has_signal, has_direct, vocab = _build_pathway_matrix(G)
 
     n_annotated = int(has_direct.sum())
@@ -156,7 +159,7 @@ def run_pathway_landscape_1(G, node_layer, nodes_path):
     n_propagated = int(has_signal.sum()) - n_annotated
     meta = dict(
         method=(
-            "Pathway functional landscape: TF-IDF-weighted pathways_a multi-hot "
+            f"Pathway functional landscape: TF-IDF-weighted {pw_col} multi-hot "
             "(propagated to unannotated nodes via 1-2 hop neighbor mean-pooling) "
             "-> TruncatedSVD -> UMAP(3D) -- similarity in real biological pathway "
             "space, not structural proxies"
@@ -174,7 +177,7 @@ def run_pathway_landscape_1(G, node_layer, nodes_path):
         },
         weighting_desc="none (feature-space embedding)",
         fallback_notes=(
-            f"{n_annotated} nodes have direct pathways_a annotation; {n_propagated} "
+            f"{n_annotated} nodes have direct {pw_col} annotation; {n_propagated} "
             f"more got an inferred profile via 1-2 hop neighbor mean-pooling; "
             f"{len(remaining)} nodes with no annotated node within 2 hops placed via "
             f"Fibonacci-sphere shell"

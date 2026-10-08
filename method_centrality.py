@@ -15,10 +15,12 @@ import networkx as nx
 import common as c
 
 def _get_or_compute_fa2_xy(G, nodes_path):
+    id_col = c.columns(G).id
     header, rows = c.read_nodes_tsv(nodes_path)
-    if "x_fa2_1" in header and "y_fa2_1" in header:
-        xy = {row["id"]: (float(row["x_fa2_1"]), float(row["y_fa2_1"])) for row in rows}
-        return xy, False
+    if "x_fa2_1" in header and "y_fa2_1" in header and id_col in header:
+        xy = {row[id_col]: (float(row["x_fa2_1"]), float(row["y_fa2_1"])) for row in rows}
+        if set(xy) == set(G.nodes()):
+            return xy, False
     pos = nx.forceatlas2_layout(G, max_iter=100, seed=c.GLOBAL_SEED, dim=2)
     return {n: (float(p[0]), float(p[1])) for n, p in pos.items()}, True
 
@@ -70,12 +72,12 @@ def run_topobet_1(G, node_layer, nodes_path):
 
 
 def _domain_touch_count(G: nx.Graph) -> dict[str, int]:
-    """# of distinct layers (the layer_c domains, e.g. transcript / protein /
-    metabolite) a node's own layer plus its 1-hop neighborhood collectively
-    touch (1 .. number of layers). Catches low-degree nodes that quietly
-    bridge multiple layers -- a signal neither the layer label alone nor
-    centrality alone expresses: a protein node adjacent to transcript and
-    metabolite neighbors ranks as a strong connector even at degree 2."""
+    """# of distinct layers (values of the layer column) a node's own layer
+    plus its 1-hop neighborhood collectively touch (1 .. number of layers).
+    Catches low-degree nodes that quietly bridge multiple layers -- a signal
+    neither the layer label alone nor centrality alone expresses: a node
+    adjacent to neighbours from two other layers ranks as a strong connector
+    even at degree 2."""
     counts: dict[str, int] = {}
     for n in G.nodes():
         domains = {G.nodes[n]["layer"]}
@@ -96,14 +98,15 @@ def run_domaintouch_1(G, node_layer, nodes_path):
 
 def _rarest_incident_edge_score(G: nx.Graph) -> dict[str, float]:
     """z-score per node = -ln(rarest_incident_edge_type_count / total_edges):
-    a node touching a rare edge_type_c scores high even at low degree; a
-    hub whose many edges are all of a common type scores low despite high degree
-    -- the opposite signal from topodeg_1/topobet_1."""
-    type_counts = Counter(data.get("edge_type_c", "") for _, _, data in G.edges(data=True))
+    a node touching a rare edge type (value of the edge-type column) scores
+    high even at low degree; a hub whose many edges are all of a common type
+    scores low despite high degree -- the opposite signal from
+    topodeg_1/topobet_1."""
+    type_counts = Counter(data.get("edge_type", "") for _, _, data in G.edges(data=True))
     total = sum(type_counts.values()) or 1
     scores: dict[str, float] = {}
     for n in G.nodes():
-        incident_types = [G.edges[n, nb].get("edge_type_c", "") for nb in G.neighbors(n)]
+        incident_types = [G.edges[n, nb].get("edge_type", "") for nb in G.neighbors(n)]
         if not incident_types:
             scores[n] = 0.0
             continue
@@ -117,5 +120,5 @@ def run_raritytouch_1(G, node_layer, nodes_path):
         G, node_layer, nodes_path,
         metric_name="rarest_incident_edge_type_score",
         metric_fn=_rarest_incident_edge_score,
-        library_call="custom: -ln(min(edge_type_c count among incident edges) / total_edges)",
+        library_call=f"custom: -ln(min({c.columns(G).edge_type} count among incident edges) / total_edges)",
     )

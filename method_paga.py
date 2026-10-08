@@ -68,7 +68,7 @@ def run_paga_1(G, node_layer, nodes_path):
     offset_scale = c.LOCAL_CLUSTER_RADIUS * meta_spread
     for cid, members in communities.items():
         slot = meta_pos[cid]
-        members_sorted = sorted(members, key=lambda n: int(n))
+        members_sorted = sorted(members, key=c.node_key)
         dirs = c.fibonacci_sphere(len(members_sorted))
         for nid, d in zip(members_sorted, dirs):
             init_pos[nid] = slot + d * offset_scale * math.sqrt(len(members_sorted)) / math.sqrt(10)

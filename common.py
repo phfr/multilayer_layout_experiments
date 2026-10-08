@@ -33,15 +33,62 @@ from tqdm import tqdm
 
 GLOBAL_SEED = 42
 
-# Layer model. LAYER_COLUMN is the nodes.tsv column holding each node's layer
-# (a categorical `_c` column, per the frontend's suffix convention). LAYER_ORDER
-# is the default stacking order, first = bottom / innermost, last = top /
-# outermost, used by every layout that arranges layers along an axis or in
-# concentric shells; run_layouts.py --layer-order overrides it per run, and the
-# effective order is stored on the graph (G.graph["layer_order"], read via
-# layer_order(G)). The order must list exactly the values present in the data.
-LAYER_COLUMN = "layer_c"
-LAYER_ORDER = ("transcript", "protein", "metabolite")
+# Column roles. Nothing in this package reads nodes.tsv / edges.tsv through a
+# literal column name: every layout sees the graph through ROLES (node attrs
+# 'layer', 'type', 'pathways'; edge attr 'edge_type'), and ColumnSpec says
+# which input column fills each role. The defaults match the wwiznet export
+# (layer_c / type_a / pathways_a / edge_type_c, per the frontend's `_c`
+# categorical / `_a` array suffix convention) so that dataset needs no flags;
+# any other dataset is handled with run_layouts.py's --*-column flags. The
+# optional roles (type, pathways, edge_type) may be None ("this dataset has no
+# such column"), and a configured-but-absent optional column is tolerated:
+# layouts that need the role are skipped (not failed) by run_layouts.py via
+# missing_role_columns().
+#
+# Layer stacking order (first = bottom / innermost, last = top / outermost,
+# used by every layout that arranges layers along an axis or in concentric
+# shells) defaults to descending node count per layer (ties: first appearance
+# in nodes.tsv) -- deterministic and independent of row order, and the same
+# order the old hardcoded transcript/protein/metabolite default produced;
+# run_layouts.py --layer-order overrides it. The effective order is stored on
+# the graph (G.graph["layer_order"]) and read via layer_order(G).
+
+
+@dataclass(frozen=True)
+class ColumnSpec:
+    id: str = "id"
+    layer: str = "layer_c"
+    type: str | None = "type_a"
+    pathways: str | None = "pathways_a"
+    source: str = "source"
+    target: str = "target"
+    edge_type: str | None = "edge_type_c"
+
+    # role -> which file the column lives in (for requirement checks / messages)
+    NODE_ROLES = ("id", "layer", "type", "pathways")
+    EDGE_ROLES = ("source", "target", "edge_type")
+    OPTIONAL_ROLES = ("type", "pathways", "edge_type")
+    # role -> the run_layouts.py flag that sets it (see add_column_arguments)
+    FLAG_FOR_ROLE = {
+        "id": "--id-column", "layer": "--layer-column", "type": "--type-column",
+        "pathways": "--pathway-column", "source": "--source-column",
+        "target": "--target-column", "edge_type": "--edge-type-column",
+    }
+
+    def column_for(self, role: str) -> str | None:
+        if role not in self.NODE_ROLES and role not in self.EDGE_ROLES:
+            raise KeyError(f"unknown column role {role!r}; known: {self.NODE_ROLES + self.EDGE_ROLES}")
+        return getattr(self, role)
+
+    def describe(self) -> str:
+        parts = []
+        for role in self.NODE_ROLES + self.EDGE_ROLES:
+            col = getattr(self, role)
+            parts.append(f"{role}={col if col is not None else '(none)'}")
+        return " ".join(parts)
+
+
+DEFAULT_COLUMNS = ColumnSpec()
 
 # Output folder file names (input folder uses the same nodes/edges names).
 NODES_FILENAME = "nodes.tsv"
@@ -112,6 +159,17 @@ HIVE_AXIS_LENGTH = 50.0
 RESERVED_SUFFIXES = ("_c_kv", "_kv", "_a", "_c", "_n", "_norm")
 
 
+def node_key(n: str):
+    """Deterministic sort key for node ids: integer-like ids sort numerically
+    (so '10' comes after '9'), everything else lexicographically after them.
+    Every helper and layout that needs a stable node order uses this instead
+    of int(id), so ids such as 'P12345' or 'ENSG...' work unchanged."""
+    try:
+        return (0, int(n), "")
+    except (TypeError, ValueError):
+        return (1, 0, str(n))
+
+
 def validate_base_name(base_name: str) -> None:
     for suffix in RESERVED_SUFFIXES:
         if base_name.endswith(suffix):
@@ -168,6 +226,7 @@ def write_layout_columns(
     base_name: str,
     coords: dict[str, tuple[float, float, float]],
     *,
+    id_column: str = DEFAULT_COLUMNS.id,
     precision: int = 6,
 ) -> bool:
     """Add or overwrite x_<base>/y_<base>/z_<base> columns in the OUTPUT
@@ -188,7 +247,9 @@ def write_layout_columns(
     if not is_overwrite:
         header = header + [x_col, y_col, z_col]
 
-    missing = [row["id"] for row in rows if row["id"] not in coords]
+    if id_column not in header:
+        raise ValueError(f"{nodes_path} has no {id_column!r} column (columns: {header})")
+    missing = [row[id_column] for row in rows if row[id_column] not in coords]
     if missing:
         raise ValueError(
             f"write_layout_columns({base_name!r}): missing coords for "
@@ -196,7 +257,7 @@ def write_layout_columns(
         )
 
     for row in rows:
-        x, y, z = coords[row["id"]]
+        x, y, z = coords[row[id_column]]
         row[x_col] = f"{float(x):.{precision}f}"
         row[y_col] = f"{float(y):.{precision}f}"
         row[z_col] = f"{float(z):.{precision}f}"
@@ -222,7 +283,9 @@ class OutputPaths:
     notes: list[str] = field(default_factory=list)
 
 
-def prepare_output_dir(input_dir: Path, output_dir: Path) -> OutputPaths:
+def prepare_output_dir(
+    input_dir: Path, output_dir: Path, *, id_column: str = DEFAULT_COLUMNS.id
+) -> OutputPaths:
     """Creates output_dir and seeds it from input_dir so every layout can
     read/write the OUTPUT nodes.tsv and the input folder stays untouched:
 
@@ -238,7 +301,8 @@ def prepare_output_dir(input_dir: Path, output_dir: Path) -> OutputPaths:
     - output/layout_run_log.txt: path only (created on first append).
 
     Pointing --output-dir at the input folder is allowed and degrades to the
-    old in-place behaviour (nothing is copied).
+    old in-place behaviour (nothing is copied). `id_column` is the node id
+    column (ColumnSpec.id) used to match rows between the two files.
     """
     nodes_in, edges_in = input_dir / NODES_FILENAME, input_dir / EDGES_FILENAME
     output_dir.mkdir(parents=True, exist_ok=True)
@@ -256,8 +320,12 @@ def prepare_output_dir(input_dir: Path, output_dir: Path) -> OutputPaths:
     else:
         header_in, rows_in = read_nodes_tsv(nodes_in)
         header_out, rows_out = read_nodes_tsv(nodes_out)
-        ids_in = [r["id"] for r in rows_in]
-        if set(ids_in) != {r["id"] for r in rows_out}:
+        if id_column not in header_in or id_column not in header_out:
+            raise ValueError(
+                f"node id column {id_column!r} must exist in both {nodes_in} and {nodes_out}"
+            )
+        ids_in = [r[id_column] for r in rows_in]
+        if set(ids_in) != {r[id_column] for r in rows_out}:
             raise ValueError(
                 f"{nodes_out} already exists but holds a different node id set than "
                 f"{nodes_in} ({len(rows_out)} vs {len(rows_in)} rows); delete it or pick "
@@ -268,9 +336,9 @@ def prepare_output_dir(input_dir: Path, output_dir: Path) -> OutputPaths:
             if col not in header_in and col[:2] in ("x_", "y_", "z_")
             and col[2:] in get_existing_layout_bases(header_out)
         ]
-        by_id = {r["id"]: r for r in rows_out}
+        by_id = {r[id_column]: r for r in rows_out}
         for row in rows_in:
-            src = by_id[row["id"]]
+            src = by_id[row[id_column]]
             for col in carried:
                 row[col] = src[col]
         _write_tsv_atomic(
@@ -344,8 +412,38 @@ def append_log_entry(
 
 
 def layer_order(G: nx.Graph) -> tuple[str, ...]:
-    """The layer stacking order this graph was loaded with (see LAYER_ORDER)."""
-    return tuple(G.graph.get("layer_order", LAYER_ORDER))
+    """The layer stacking order this graph was loaded with (first = bottom /
+    innermost). Set by build_graph(); the only sanctioned way for a layout to
+    learn the layer names."""
+    try:
+        return tuple(G.graph["layer_order"])
+    except KeyError:
+        raise ValueError("graph was not built by common.build_graph(): no layer_order") from None
+
+
+def columns(G: nx.Graph) -> ColumnSpec:
+    """The ColumnSpec this graph was loaded with -- for log/description text
+    that wants to name the actual input column behind a role (e.g. "one
+    spoke per <type column> value"). Layout LOGIC should read the node/edge
+    attributes ('layer', 'type', 'pathways', 'edge_type'), not this."""
+    return G.graph.get("columns", DEFAULT_COLUMNS)
+
+
+INFERRED_LAYER_ORDER_RULE = "node count descending, ties by first appearance"
+
+
+def infer_layer_order(node_rows: list[dict[str, str]], layer_column: str) -> tuple[str, ...]:
+    """Default stacking order when --layer-order is not given: the distinct
+    layer values by descending node count, ties broken by first appearance in
+    nodes.tsv (INFERRED_LAYER_ORDER_RULE). Deterministic and independent of
+    how the rows happen to be sorted; pass --layer-order for any other order."""
+    counts: Counter = Counter()
+    first_seen: dict[str, int] = {}
+    for i, row in enumerate(node_rows):
+        layer = (row.get(layer_column) or "").strip()
+        counts[layer] += 1
+        first_seen.setdefault(layer, i)
+    return tuple(sorted(counts, key=lambda layer: (-counts[layer], first_seen[layer])))
 
 
 def layer_axis_offsets(order: Iterable[str], step: float) -> dict[str, float]:
@@ -357,8 +455,9 @@ def layer_axis_offsets(order: Iterable[str], step: float) -> dict[str, float]:
 
 
 def parse_pathways(raw: str) -> frozenset:
-    """pathways_a (optional column) is a comma-separated list of pathway
-    names; empty string / missing column -> empty set."""
+    """The pathways column (optional, an `_a` array column in the frontend's
+    convention) is a comma-separated list of pathway names; empty string /
+    missing column -> empty set."""
     if not raw or not raw.strip():
         return frozenset()
     return frozenset(t.strip() for t in raw.split(",") if t.strip())
@@ -368,64 +467,128 @@ def build_graph(
     node_rows: list[dict[str, str]],
     edge_rows: list[dict[str, str]],
     *,
-    layer_column: str = LAYER_COLUMN,
-    layer_order: Iterable[str] = LAYER_ORDER,
+    columns: ColumnSpec = DEFAULT_COLUMNS,
+    layer_order: Iterable[str] | None = None,
 ) -> tuple[nx.Graph, dict[str, str]]:
     """Adds every node id from node_rows first (so degree-0 nodes are present),
     then every edge. Returns (G, node_layer). Nodes carry 'layer' (from
-    `layer_column`, validated against `layer_order`), the raw 'type_a'
-    (empty string if the column is absent), and 'pathways' (frozenset parsed
-    from pathways_a, empty if absent/unannotated) as attributes; edges carry
-    the raw 'edge_type_c'. The effective layer order is stored as
-    G.graph["layer_order"] so layouts can read it via layer_order(G).
+    columns.layer, validated against `layer_order`), 'type' (raw value of
+    columns.type, '' if that role has no column or the column is absent) and
+    'pathways' (frozenset parsed from columns.pathways, empty if absent /
+    unannotated) as attributes; edges carry 'edge_type' (raw value of
+    columns.edge_type, '' if none). The effective layer order (given, or
+    inferred via infer_layer_order() when None) is stored as
+    G.graph["layer_order"] and the ColumnSpec as G.graph["columns"], read via
+    layer_order(G) / columns(G).
 
-    Raises ValueError on a missing layer column, layer values outside
-    `layer_order` (or order entries absent from the data), or an edge
-    endpoint that is not a node -- all of which would otherwise surface as a
-    confusing KeyError deep inside some layout.
+    Raises ValueError on a missing required column (id / layer / source /
+    target), layer values outside an explicit `layer_order` (or order entries
+    absent from the data), or an edge endpoint that is not a node -- all of
+    which would otherwise surface as a confusing KeyError deep inside some
+    layout.
     """
-    order = tuple(layer_order)
+    node_header = list(node_rows[0].keys()) if node_rows else []
+    edge_header = list(edge_rows[0].keys()) if edge_rows else []
+    for role in ("id", "layer"):
+        col = columns.column_for(role)
+        if node_rows and col not in node_header:
+            raise ValueError(
+                f"nodes.tsv has no {col!r} column for role {role!r} (columns: {node_header}); "
+                f"pass {ColumnSpec.FLAG_FOR_ROLE[role]}"
+            )
+    for role in ("source", "target"):
+        col = columns.column_for(role)
+        if edge_rows and col not in edge_header:
+            raise ValueError(
+                f"edges.tsv has no {col!r} column for role {role!r} (columns: {edge_header}); "
+                f"pass {ColumnSpec.FLAG_FOR_ROLE[role]}"
+            )
+
+    if layer_order is None:
+        order = infer_layer_order(node_rows, columns.layer)
+    else:
+        order = tuple(layer_order)
     if len(set(order)) != len(order) or not order:
         raise ValueError(f"layer order must be a non-empty list of distinct names, got {order}")
-    if node_rows and layer_column not in node_rows[0]:
+    if "" in order:
         raise ValueError(
-            f"nodes.tsv has no {layer_column!r} column (columns: {list(node_rows[0].keys())})"
+            f"some nodes have an empty {columns.layer!r} value; every node needs a layer"
         )
+
+    type_col = columns.type if columns.type in node_header else None
+    pathways_col = columns.pathways if columns.pathways in node_header else None
+    edge_type_col = columns.edge_type if columns.edge_type in edge_header else None
+
     G = nx.Graph()
     G.graph["layer_order"] = order
-    G.graph["layer_column"] = layer_column
+    G.graph["layer_column"] = columns.layer
+    G.graph["columns"] = columns
     node_layer: dict[str, str] = {}
     unknown: Counter = Counter()
     for row in node_rows:
-        nid = row["id"]
-        layer = (row.get(layer_column) or "").strip()
+        nid = row[columns.id]
+        if nid in G:
+            raise ValueError(f"duplicate node id {nid!r} in nodes.tsv ({columns.id!r} column)")
+        layer = (row.get(columns.layer) or "").strip()
         if layer not in order:
             unknown[layer] += 1
         G.add_node(
             nid,
             layer=layer,
-            type_a=row.get("type_a", ""),
-            pathways=parse_pathways(row.get("pathways_a", "")),
+            type=(row.get(type_col) or "").strip() if type_col else "",
+            pathways=parse_pathways(row.get(pathways_col, "")) if pathways_col else frozenset(),
         )
         node_layer[nid] = layer
     if unknown:
         raise ValueError(
-            f"{layer_column} values not in the layer order {order}: "
+            f"{columns.layer} values not in the layer order {order}: "
             f"{dict(unknown)} (value -> node count); pass --layer-order listing every value"
         )
     present = set(node_layer.values())
     absent = [layer for layer in order if layer not in present]
     if absent:
         raise ValueError(
-            f"layer order {order} names layer(s) with no nodes in {layer_column}: {absent}; "
+            f"layer order {order} names layer(s) with no nodes in {columns.layer}: {absent}; "
             f"values present: {sorted(present)}"
         )
     for row in edge_rows:
-        u, v = row["source"], row["target"]
+        u, v = row[columns.source], row[columns.target]
         if u not in G or v not in G:
-            raise ValueError(f"edge {u}-{v} references a node id missing from nodes.tsv")
-        G.add_edge(u, v, edge_type_c=row.get("edge_type_c", ""))
+            raise ValueError(
+                f"edge {u}-{v} references a node id missing from nodes.tsv "
+                f"({columns.source}/{columns.target} vs {columns.id})"
+            )
+        G.add_edge(u, v, edge_type=(row.get(edge_type_col) or "") if edge_type_col else "")
     return G, node_layer
+
+
+def missing_role_columns(
+    columns: ColumnSpec,
+    roles: Iterable[str],
+    *,
+    node_header: list[str],
+    node_rows: list[dict[str, str]],
+    edge_header: list[str],
+    edge_rows: list[dict[str, str]],
+) -> list[str]:
+    """For each optional column role in `roles`, a human-readable reason it
+    is unavailable (no column configured / column absent / column empty in
+    every row), or nothing if it is usable. run_layouts.py uses this to skip
+    layouts whose RunSpec.requires names a role the input can't fill."""
+    reasons = []
+    for role in roles:
+        col = columns.column_for(role)
+        in_nodes = role in ColumnSpec.NODE_ROLES
+        header, rows, fname = (
+            (node_header, node_rows, NODES_FILENAME) if in_nodes else (edge_header, edge_rows, EDGES_FILENAME)
+        )
+        if col is None:
+            reasons.append(f"no column configured for role {role!r} ({ColumnSpec.FLAG_FOR_ROLE[role]})")
+        elif col not in header:
+            reasons.append(f"column {col!r} ({role}) absent from {fname}")
+        elif not any((row.get(col) or "").strip() for row in rows):
+            reasons.append(f"column {col!r} ({role}) empty in every row of {fname}")
+    return reasons
 
 
 # --------------------------------------------------------------------------
@@ -467,9 +630,9 @@ def set_distance_weight(
 
 
 def sorted_components(H: nx.Graph) -> list[set]:
-    """Connected components of H, largest first, then min(int(id)) ascending."""
+    """Connected components of H, largest first, then smallest node_key ascending."""
     return sorted(
-        nx.connected_components(H), key=lambda c: (-len(c), min(int(n) for n in c))
+        nx.connected_components(H), key=lambda comp: (-len(comp), min(node_key(n) for n in comp))
     )
 
 
@@ -478,8 +641,50 @@ def giant_component_nodes(H: nx.Graph) -> set:
 
 
 def isolated_nodes(H: nx.Graph) -> list[str]:
-    """Degree-0 node ids in H, sorted by int(id)."""
-    return sorted((n for n in H.nodes() if H.degree(n) == 0), key=lambda n: int(n))
+    """Degree-0 node ids in H, sorted by node_key."""
+    return sorted((n for n in H.nodes() if H.degree(n) == 0), key=node_key)
+
+
+def ordered_subgraph(G: nx.Graph, nodes: Iterable[str]) -> nx.Graph:
+    """Induced subgraph of G on `nodes` as a real nx.Graph whose node order
+    AND every node's neighbour order are G's own (file) order, filtered --
+    use this, not G.subgraph(...), for any subgraph that is fed to a layout
+    or embedding algorithm.
+
+    Why: networkx subgraph *views* iterate their nodes in `set` order
+    whenever the kept node set is smaller than half the graph
+    (nx.filters.show_nodes keeps a set), and str hashes are randomised per
+    process. Layout algorithms seed their RNG but hand out initial positions
+    by node iteration order, so fa2sep_1, community_1 and n2vlayered_1
+    (per-layer / per-community subgraphs) came out different on every run
+    even with a fixed seed. Neighbour order matters too: random-walk methods
+    (node2vec, metapath_1) pick the next step by position in G.neighbors(),
+    so the adjacency is copied per node in G's order rather than through
+    add_edges_from (which would append the reverse direction of each edge
+    to the other endpoint early and reorder its neighbours -- the reason
+    nx.Graph.copy() is not a substitute). For a kept set that is at least
+    half the graph a view already iterates in G's order, and this reproduces
+    that exactly, so results for those cases are unchanged byte for byte.
+    Node attribute dicts are shared with G (as a view shares them); edge
+    attribute dicts are copies shared by both directions, so callers may
+    write weights into the result without touching G.
+    """
+    keep = set(nodes)
+    H = nx.Graph()
+    H.graph.update(G.graph)
+    H.add_nodes_from((n, d) for n, d in G.nodes(data=True) if n in keep)
+    shared_edge_data: dict[frozenset, dict] = {}
+    for u in H:
+        nbrs = H._adj[u]  # the canonical dict-of-dicts; filled in G's neighbour order
+        for v, data in G._adj[u].items():
+            if v not in keep:
+                continue
+            key = frozenset((u, v))
+            edge_data = shared_edge_data.get(key)
+            if edge_data is None:
+                edge_data = shared_edge_data[key] = dict(data)
+            nbrs[v] = edge_data
+    return H
 
 
 # --------------------------------------------------------------------------
@@ -556,12 +761,12 @@ def deterministic_fallback_shell(
 
     result: dict[str, np.ndarray] = {}
     for comp, direction in zip(comps, directions):
-        comp_nodes = sorted(comp, key=lambda n: int(n))
+        comp_nodes = sorted(comp, key=node_key)
         slot = centroid + shell_radius_factor * radius * direction
         if len(comp_nodes) == 1:
             result[comp_nodes[0]] = slot
             continue
-        local = local_component_sublayout(sub.subgraph(comp_nodes))
+        local = local_component_sublayout(ordered_subgraph(G, comp_nodes))
         scale = local_cluster_radius * radius * math.sqrt(len(comp_nodes)) / math.sqrt(10)
         for node, p in local.items():
             result[node] = slot + p * scale
@@ -592,7 +797,7 @@ def place_isolated_ring_per_layer(
 
     result: dict[str, np.ndarray] = {}
     for layer, ids in by_layer.items():
-        ids_sorted = sorted(ids, key=lambda n: int(n))
+        ids_sorted = sorted(ids, key=node_key)
         pts = ring_positions_2d(len(ids_sorted), ring_r)
         z = z_by_layer[layer]
         for nid, p in zip(ids_sorted, pts):
@@ -608,7 +813,7 @@ def place_isolated_sphere_shell(
 ) -> dict[str, np.ndarray]:
     """For free-3D layouts (fa23d/fr3d): places degree-0 nodes on a
     Fibonacci-sphere shell around `pos3d`'s bounding sphere."""
-    isolated_ids = sorted(isolated_ids, key=lambda n: int(n))
+    isolated_ids = sorted(isolated_ids, key=node_key)
     if not isolated_ids:
         return {}
     centroid, radius = _bounding_centroid_radius(pos3d)
@@ -635,7 +840,7 @@ def spectral_positions(
     """
     from sklearn.manifold import SpectralEmbedding
 
-    nodes = sorted(H.nodes(), key=lambda n: int(n))
+    nodes = sorted(H.nodes(), key=node_key)
     idx = {n: i for i, n in enumerate(nodes)}
     n = len(nodes)
     adj = np.zeros((n, n))
@@ -665,8 +870,8 @@ def prepare_seed_positions(
     SEED_TARGET_RMS_PER_SQRT_N * sqrt(n)), and adds deterministic Gaussian
     jitter (`jitter_fraction` * target_rms per coordinate) so coincident
     points -- which make ForceAtlas2's repulsion divide by zero -- are
-    separated. Node order is sorted by int(id) so the jitter is reproducible."""
-    nodes = sorted(pos, key=lambda n: int(n))
+    separated. Node order is sorted by node_key so the jitter is reproducible."""
+    nodes = sorted(pos, key=node_key)
     arr = np.array([pos[n] for n in nodes], dtype=float)
     if len(nodes) == 0:
         return {}
@@ -743,26 +948,104 @@ class GraphData:
     node_layer: dict[str, str]
     node_rows: list[dict[str, str]]
     header: list[str]
+    edge_rows: list[dict[str, str]] = field(default_factory=list)
+    edge_header: list[str] = field(default_factory=list)
+    columns: ColumnSpec = DEFAULT_COLUMNS
     edge_count: int = 0
+
+    def missing_role_columns(self, roles: Iterable[str]) -> list[str]:
+        return missing_role_columns(
+            self.columns, roles,
+            node_header=self.header, node_rows=self.node_rows,
+            edge_header=self.edge_header, edge_rows=self.edge_rows,
+        )
 
 
 def load_graph(
     nodes_path: Path,
     edges_path: Path,
     *,
-    layer_column: str = LAYER_COLUMN,
-    layer_order: Iterable[str] = LAYER_ORDER,
+    columns: ColumnSpec = DEFAULT_COLUMNS,
+    layer_order: Iterable[str] | None = None,
 ) -> GraphData:
     header, node_rows = read_nodes_tsv(nodes_path)
+    with open(edges_path, newline="", encoding="utf-8") as f:
+        edge_header = list(csv.DictReader(f, delimiter="\t").fieldnames or [])
     edge_rows = read_edges_tsv(edges_path)
-    G, node_layer = build_graph(
-        node_rows, edge_rows, layer_column=layer_column, layer_order=layer_order
-    )
+    G, node_layer = build_graph(node_rows, edge_rows, columns=columns, layer_order=layer_order)
     return GraphData(
-        G=G, node_layer=node_layer, node_rows=node_rows, header=header, edge_count=len(edge_rows)
+        G=G, node_layer=node_layer, node_rows=node_rows, header=header,
+        edge_rows=edge_rows, edge_header=edge_header, columns=columns, edge_count=len(edge_rows),
     )
 
 
-def parse_layer_order(raw: str) -> tuple[str, ...]:
-    """'transcript,protein,metabolite' -> ('transcript', 'protein', 'metabolite')."""
+def parse_layer_order(raw: str | None) -> tuple[str, ...] | None:
+    """'transcript,protein,metabolite' -> ('transcript', 'protein', 'metabolite');
+    None / blank -> None (= infer from the data, see infer_layer_order)."""
+    if raw is None or not raw.strip():
+        return None
     return tuple(x.strip() for x in raw.split(",") if x.strip())
+
+
+# --------------------------------------------------------------------------
+# CLI plumbing shared by run_layouts.py and evaluate_umap_params.py
+# --------------------------------------------------------------------------
+
+_NONE_WORDS = ("", "none", "-")
+
+
+def add_column_arguments(parser) -> None:
+    """--id-column / --layer-column / --type-column / --pathway-column /
+    --source-column / --target-column / --edge-type-column and --layer-order,
+    with the ColumnSpec defaults. Pass '' or 'none' to an optional-role flag
+    to say the dataset has no such column."""
+    d = DEFAULT_COLUMNS
+    g = parser.add_argument_group(
+        "input columns",
+        f"which {NODES_FILENAME} / {EDGES_FILENAME} columns play which role (defaults match the "
+        "wwiznet export; the optional ones accept 'none')",
+    )
+    g.add_argument("--id-column", default=d.id, metavar="COL",
+                   help=f"{NODES_FILENAME} node id column (default: %(default)s)")
+    g.add_argument("--layer-column", default=d.layer, metavar="COL",
+                   help=f"{NODES_FILENAME} column holding each node's layer (default: %(default)s)")
+    g.add_argument("--type-column", default=d.type, metavar="COL",
+                   help=f"optional {NODES_FILENAME} column with a finer per-node type, used by hive5_1 / "
+                        f"landscape_1 (default: %(default)s)")
+    g.add_argument("--pathway-column", default=d.pathways, metavar="COL",
+                   help=f"optional {NODES_FILENAME} column with comma-separated pathway annotations, used by "
+                        f"fa2pathway_1 / pathway_landscape_1 (default: %(default)s)")
+    g.add_argument("--source-column", default=d.source, metavar="COL",
+                   help=f"{EDGES_FILENAME} source node id column (default: %(default)s)")
+    g.add_argument("--target-column", default=d.target, metavar="COL",
+                   help=f"{EDGES_FILENAME} target node id column (default: %(default)s)")
+    g.add_argument("--edge-type-column", default=d.edge_type, metavar="COL",
+                   help=f"optional {EDGES_FILENAME} column with a categorical edge type, used by the "
+                        f"rarity layouts and landscape_1 (default: %(default)s)")
+    g.add_argument(
+        "--layer-order", type=str, default=None, metavar="L1,L2,...",
+        help=(
+            "comma-separated values of the layer column, bottom/innermost first; must list exactly "
+            "the values present (default: node count descending, ties by first appearance)"
+        ),
+    )
+
+
+def columns_from_args(args) -> ColumnSpec:
+    def opt(v: str | None) -> str | None:
+        return None if v is None or v.strip().lower() in _NONE_WORDS else v.strip()
+
+    def req(v: str, flag: str) -> str:
+        if v is None or not v.strip() or v.strip().lower() in _NONE_WORDS[1:]:
+            raise ValueError(f"{flag} needs a column name")
+        return v.strip()
+
+    return ColumnSpec(
+        id=req(args.id_column, "--id-column"),
+        layer=req(args.layer_column, "--layer-column"),
+        type=opt(args.type_column),
+        pathways=opt(args.pathway_column),
+        source=req(args.source_column, "--source-column"),
+        target=req(args.target_column, "--target-column"),
+        edge_type=opt(args.edge_type_column),
+    )

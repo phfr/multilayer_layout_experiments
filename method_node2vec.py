@@ -19,8 +19,8 @@ import common as c
 
 def _node2vec_embedding(G, *, p: float, q: float):
     giant = c.giant_component_nodes(G)
-    giant_nodes = sorted(giant, key=lambda n: int(n))
-    sub = G.subgraph(giant_nodes)
+    giant_nodes = sorted(giant, key=c.node_key)
+    sub = c.ordered_subgraph(G, giant_nodes)
 
     n2v = Node2Vec(
         sub,

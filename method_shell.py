@@ -29,7 +29,7 @@ def _shell_layout(G, node_layer, *, order: tuple[str, ...]):
         comps = c.sorted_components(sub) if n_k else []
         ordered_nodes: list[str] = []
         for comp in comps:
-            ordered_nodes.extend(sorted(comp, key=lambda x: int(x)))
+            ordered_nodes.extend(sorted(comp, key=c.node_key))
 
         dirs = c.fibonacci_sphere(len(ordered_nodes))
         for nid, d in zip(ordered_nodes, dirs):
@@ -79,14 +79,15 @@ def run_shell_2(G, node_layer, nodes_path):
 
 def run_shell_rarity_1(G, node_layer, nodes_path):
     """Same deterministic-geometry mechanism as shell_1/shell_2, but shell
-    assignment is by the rarest edge_type_c a node touches, not its layer --
-    a self-contained grouping principle: rare cross-domain connectors form
-    the innermost shell regardless of which layer they belong to, nodes
-    touching only common edge types form the outer shells. Bands are
-    data-driven: one per distinct edge_type_c frequency, rarest first (edge
-    types with equal counts share a band); isolated nodes (no incident
-    edges) get their own outermost band."""
-    type_counts = Counter(data.get("edge_type_c", "") for _, _, data in G.edges(data=True))
+    assignment is by the rarest edge type (value of the edge-type column) a
+    node touches, not its layer -- a self-contained grouping principle: rare
+    cross-domain connectors form the innermost shell regardless of which
+    layer they belong to, nodes touching only common edge types form the
+    outer shells. Bands are data-driven: one per distinct edge-type
+    frequency, rarest first (edge types with equal counts share a band);
+    isolated nodes (no incident edges) get their own outermost band."""
+    et_col = c.columns(G).edge_type
+    type_counts = Counter(data.get("edge_type", "") for _, _, data in G.edges(data=True))
     distinct_counts = sorted(set(type_counts.values()))
     band_of_count = {cnt: i for i, cnt in enumerate(distinct_counts)}
     bands = {
@@ -95,7 +96,7 @@ def run_shell_rarity_1(G, node_layer, nodes_path):
     }
 
     def rarest_count(n):
-        incident = [G.edges[n, nb].get("edge_type_c", "") for nb in G.neighbors(n)]
+        incident = [G.edges[n, nb].get("edge_type", "") for nb in G.neighbors(n)]
         if not incident:
             return None
         return min(type_counts[et] for et in incident)
@@ -124,7 +125,7 @@ def run_shell_rarity_1(G, node_layer, nodes_path):
         comps = c.sorted_components(sub)
         ordered_nodes: list[str] = []
         for comp in comps:
-            ordered_nodes.extend(sorted(comp, key=lambda x: int(x)))
+            ordered_nodes.extend(sorted(comp, key=c.node_key))
 
         dirs = c.fibonacci_sphere(len(ordered_nodes))
         for nid, d in zip(ordered_nodes, dirs):
@@ -132,7 +133,7 @@ def run_shell_rarity_1(G, node_layer, nodes_path):
 
     meta = dict(
         method=(
-            "Concentric shells by rarity band: shell = rarest edge_type_c a node "
+            f"Concentric shells by rarity band: shell = rarest {et_col} a node "
             "touches (innermost = touches the rarest type), not layer"
         ),
         library_call="deterministic Fibonacci-sphere placement per rarity band (no simulation)",

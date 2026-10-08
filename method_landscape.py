@@ -6,8 +6,10 @@ fundamentally different signal from every distance-based layout in this
 package (Pfeil et al., "Visualizing biological data in a virtual
 environment", Nature Communications 2021, uses this idea with GO-annotation
 feature vectors and random-walk-with-restart feature vectors; we substitute
-edge_type_c/layer/type_a/community/degree as our available proxy signal,
-since we have no external annotation database).
+edge type / layer / node type / community / degree as our available proxy
+signal, since we have no external annotation database). The edge-type and
+node-type blocks are data-driven and simply absent when the input has no
+such column (see common.ColumnSpec).
 """
 
 from __future__ import annotations
@@ -21,27 +23,29 @@ import common as c
 
 
 def build_feature_matrix(G: nx.Graph):
-    """Per-node feature vector: fraction of incident edges of each
-    edge_type_c value, layer one-hot, type_a one-hot (data-driven vocabulary;
-    absent type_a column -> no such block), Louvain community one-hot,
+    """Per-node feature vector: fraction of incident edges of each edge-type
+    value, layer one-hot, node-type one-hot (data-driven vocabularies; no
+    edge-type / type column -> no such block), Louvain community one-hot,
     log-degree. Every node (including isolated ones) gets a valid vector."""
-    nodes = sorted(G.nodes(), key=lambda n: int(n))
+    nodes = sorted(G.nodes(), key=c.node_key)
     partition = community_louvain.best_partition(G, random_state=c.GLOBAL_SEED)
     community_ids = sorted(set(partition.values()))
     community_idx = {cid: i for i, cid in enumerate(community_ids)}
-    # Layer one-hot first, then raw type_a one-hot (a finer split within a
+    # Layer one-hot first, then raw node-type one-hot (a finer split within a
     # layer, e.g. protein_bridge vs protein_differentially_expressed).
     type_values = list(c.layer_order(G)) + sorted(
-        {G.nodes[n].get("type_a", "") for n in nodes} - {""}
+        {G.nodes[n].get("type", "") for n in nodes} - {""}
     )
-    type_a_idx = {t: i for i, t in enumerate(type_values)}
+    type_idx = {t: i for i, t in enumerate(type_values)}
 
     edge_type_idx: dict[str, int] = {}
     per_node_counts = []
     for n in nodes:
         counts: dict[str, int] = {}
         for _, _, data in G.edges(n, data=True):
-            et = data.get("edge_type_c", "")
+            et = data.get("edge_type", "")
+            if not et:  # no edge-type column (or untyped edge): no composition signal
+                continue
             counts[et] = counts.get(et, 0) + 1
             if et not in edge_type_idx:
                 edge_type_idx[et] = len(edge_type_idx)
@@ -56,14 +60,14 @@ def build_feature_matrix(G: nx.Graph):
         deg = G.degree(n)
         for et, cnt in counts.items():
             X[row_i, edge_type_idx[et]] = cnt / deg if deg else 0.0
-        X[row_i, n_et + type_a_idx[G.nodes[n]["layer"]]] = 1.0
-        ta = G.nodes[n].get("type_a", "")
-        if ta in type_a_idx:
-            X[row_i, n_et + type_a_idx[ta]] = 1.0
+        X[row_i, n_et + type_idx[G.nodes[n]["layer"]]] = 1.0
+        ta = G.nodes[n].get("type", "")
+        if ta in type_idx:
+            X[row_i, n_et + type_idx[ta]] = 1.0
         X[row_i, n_et + n_ta + community_idx[partition[n]]] = 1.0
         X[row_i, -1] = np.log1p(deg)
 
-    return nodes, X, {"edge_types": n_et, "layer+type_a": n_ta, "communities": len(community_ids)}
+    return nodes, X, {"edge_types": n_et, "layer+type": n_ta, "communities": len(community_ids)}
 
 
 def run_landscape_1(G, node_layer, nodes_path):
@@ -83,7 +87,7 @@ def run_landscape_1(G, node_layer, nodes_path):
     meta = dict(
         method=(
             "VRNetzer-style functional landscape: per-node feature vector "
-            "(edge_type_c composition fractions + layer/type_a one-hot + Louvain "
+            "(edge-type composition fractions + layer/type one-hot + Louvain "
             "community one-hot + log-degree) embedded via UMAP -- similarity "
             "in ANNOTATION space, not graph-distance space"
         ),
@@ -106,7 +110,7 @@ def build_rwr_feature_matrix(G: nx.Graph, *, restart_prob: float = 0.9):
     node: row i = stationary visitation distribution of a walk restarting
     at node i with probability `restart_prob`. nx.pagerank's `alpha` is the
     probability of CONTINUING the walk, so alpha = 1 - restart_prob."""
-    nodes = sorted(G.nodes(), key=lambda n: int(n))
+    nodes = sorted(G.nodes(), key=c.node_key)
     idx = {n: i for i, n in enumerate(nodes)}
     n = len(nodes)
     X = np.zeros((n, n))

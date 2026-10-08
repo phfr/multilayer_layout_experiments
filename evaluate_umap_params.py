@@ -16,8 +16,8 @@ n2vbal_phate_1, scoring each combination on two axes:
 Prints a ranked table and a recommended (n_neighbors, min_dist, spread)
 balancing both (normalized trust - normalized cv).
 
-Read-only: takes the same --input-dir / --layer-order as run_layouts.py and
-writes nothing.
+Read-only: takes the same --input-dir / --layer-order / --*-column flags as
+run_layouts.py and writes nothing.
 
 Usage:
     python evaluate_umap_params.py -i INPUT_DIR
@@ -62,16 +62,18 @@ def main() -> int:
         "-i", "--input-dir", type=Path, required=True,
         help=f"folder containing {c.NODES_FILENAME} and {c.EDGES_FILENAME} (read-only)",
     )
-    parser.add_argument(
-        "--layer-order", type=str, default=",".join(c.LAYER_ORDER),
-        help=f"comma-separated {c.LAYER_COLUMN} values, as for run_layouts.py (default: %(default)s)",
-    )
+    c.add_column_arguments(parser)
     args = parser.parse_args()
+    try:
+        columns = c.columns_from_args(args)
+    except ValueError as exc:
+        parser.error(str(exc))
 
     print(f"Loading graph and computing node2vec embedding (p={args.p}, q={args.q}) ...", flush=True)
     data = c.load_graph(
         args.input_dir / c.NODES_FILENAME,
         args.input_dir / c.EDGES_FILENAME,
+        columns=columns,
         layer_order=c.parse_layer_order(args.layer_order),
     )
     _, giant_nodes, vectors = _node2vec_embedding(data.G, p=args.p, q=args.q)
